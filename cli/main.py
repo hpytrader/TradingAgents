@@ -156,5 +156,56 @@ def backtest(
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
 
 
+@app.command("fx-scan")
+def fx_scan(
+    symbols: str = typer.Option(
+        None, "--symbols", help="Comma-separated pairs, e.g. EURUSD,XAUUSD; omit for the default majors, crosses and metals"
+    ),
+    top: int = typer.Option(10, "--top", help="How many setups to keep"),
+    min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
+    valid_hours: float = typer.Option(8.0, "--valid-hours", help="Hours before an unfilled limit order should be cancelled"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save the scan as Markdown and JSON"),
+):
+    """Scan forex and metals for intraday limit-order setups (no AI, uses OANDA prices)."""
+    from rich.table import Table
+
+    from tradingagents.dataflows.errors import VendorNotConfiguredError
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx import DEFAULT_UNIVERSE, scan
+    from tradingagents.fx.report import DISCLAIMER, save as save_scan
+
+    names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
+    try:
+        oanda.get_quote(names[0])          # fail fast on a missing or refused token
+    except VendorNotConfiguredError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+    except Exception:
+        pass                               # a problem with one pair is reported by the scan
+
+    with console.status(f"Scanning {len(names)} instruments..."):
+        result = scan(oanda.get_candles, oanda.get_quote, names,
+                      min_rr=min_rr, top=top, valid_hours=valid_hours)
+
+    if result.setups:
+        table = Table(title=f"Setups — {result.scanned_at:%Y-%m-%d %H:%M} UTC")
+        for column in ("#", "Symbol", "Order", "Entry", "Stop", "Target", "RR", "Risk pips", "Score"):
+            table.add_column(column, justify="right" if column not in ("Symbol", "Order") else "left")
+        for i, s in enumerate(result.setups, 1):
+            colour = "green" if s.direction == "long" else "red"
+            table.add_row(str(i), s.symbol, f"[{colour}]{s.order_type}[/{colour}]", str(s.entry),
+                          str(s.stop), str(s.target), f"{s.rr:.2f}", str(s.risk_pips), f"{s.score:.0f}")
+        console.print(table)
+    else:
+        console.print("[yellow]No setups met the rules right now.[/yellow]")
+    for symbol, reason in result.skipped:
+        console.print(f"[dim]{symbol}: {reason}[/dim]")
+    console.print(f"\n[dim]{DISCLAIMER}[/dim]")
+
+    if save:
+        md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"])
+        console.print(f"Saved: {md}")
+
+
 if __name__ == "__main__":
     app()
