@@ -164,6 +164,12 @@ def fx_scan(
     top: int = typer.Option(10, "--top", help="How many setups to keep"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     valid_hours: float = typer.Option(8.0, "--valid-hours", help="Hours before an unfilled limit order should be cancelled"),
+    max_per_currency: int = typer.Option(
+        2, "--max-per-currency", help="Most setups long, or short, the same currency (e.g. 3 on a strong-dollar day)"
+    ),
+    stop_atr: float = typer.Option(
+        1.0, "--stop-atr", help="Stop distance beyond the entry level, in 1-hour ATRs"
+    ),
     save: bool = typer.Option(True, "--save/--no-save", help="Save the scan as Markdown and JSON"),
 ):
     """Scan forex and metals for intraday limit-order setups (no AI, uses OANDA prices)."""
@@ -175,6 +181,9 @@ def fx_scan(
     from tradingagents.fx.report import DISCLAIMER, save as save_scan
 
     names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
+    if max_per_currency < 1 or stop_atr <= 0 or top < 1:
+        console.print("[red]--max-per-currency and --top must be at least 1, and --stop-atr above 0.[/red]")
+        raise typer.Exit(code=1)
     try:
         oanda.get_quote(names[0])          # fail fast on a missing or refused token
     except VendorNotConfiguredError as exc:
@@ -185,7 +194,8 @@ def fx_scan(
 
     with console.status(f"Scanning {len(names)} instruments..."):
         result = scan(oanda.get_candles, oanda.get_quote, names,
-                      min_rr=min_rr, top=top, valid_hours=valid_hours)
+                      min_rr=min_rr, top=top, valid_hours=valid_hours,
+                      max_per_currency=max_per_currency, stop_atr=stop_atr)
 
     if result.setups:
         table = Table(title=f"Setups — {result.scanned_at:%Y-%m-%d %H:%M} UTC")

@@ -365,7 +365,7 @@ tradingagents fx-scan                              # default instruments, RR ≥
 tradingagents fx-scan --symbols EURUSD,XAUUSD --min-rr 2.5 --top 6
 ```
 
-For each instrument it requires a clear 4-hour trend (price, 50 EMA and 200 EMA stacked, the 50 sloping with it), finds a 1-hour swing level or the 1-hour 50 EMA that a pullback could reach within 0.3–2.5 ATR, and places a limit just ahead of it with the stop beyond. The target is the nearest intact 1-hour swing on the other side paying the minimum reward-to-risk after the spread, or 2.5R when price is at new extremes. The list holds at most two trades long or short the same currency. Each setup is scored out of 100 for ranking; the score is not a win probability.
+For each instrument it requires a clear 4-hour trend (price, 50 EMA and 200 EMA stacked, the 50 sloping with it), finds a 1-hour swing level or the 1-hour 50 EMA that a pullback could reach within 0.3–2.5 ATR, and places a limit just ahead of it with the stop one 1-hour ATR beyond (`--stop-atr` to change). The target is the nearest intact 1-hour swing on the other side paying the minimum reward-to-risk after the spread, or 2.5R when price is at new extremes. The list holds at most two trades long or short the same currency (`--max-per-currency` to change). Each setup is scored out of 100 for ranking, with full marks reserved for a strong trend, a well-tested level and a swing level that coincides with the 1-hour 50 EMA; the score is not a win probability.
 
 It needs `OANDA_API_TOKEN` (a free practice account's token reads live prices) and saves each scan to `<results_dir>/fx_scans/` as Markdown and JSON.
 

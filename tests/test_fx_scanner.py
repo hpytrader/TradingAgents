@@ -196,3 +196,51 @@ def test_an_empty_scan_says_so():
     candles, quote = _market(direction=0)
     text = to_markdown(scan(candles, quote, ["EURUSD"], now=NOW))
     assert "No setups met the rules" in text
+
+
+@pytest.mark.unit
+def test_stop_sits_a_full_atr_beyond_the_level_by_default():
+    candles, quote = _market(direction=1)
+    s = scan(candles, quote, ["EURUSD"], now=NOW).setups[0]
+    # entry is 0.1 ATR in front of the level, the stop 1 ATR behind it
+    assert s.risk_pips == pytest.approx(1.1 * s.atr_pips, rel=0.05)
+
+
+@pytest.mark.unit
+def test_a_tighter_stop_only_flatters_the_rr():
+    candles, quote = _market(direction=1)
+    wide = scan(candles, quote, ["EURUSD"], now=NOW).setups[0]
+    tight = scan(candles, quote, ["EURUSD"], stop_atr=0.5, now=NOW).setups[0]
+    assert tight.risk_pips < wide.risk_pips
+    assert tight.rr > wide.rr
+
+
+@pytest.mark.unit
+def test_the_currency_cap_is_adjustable():
+    setups = [_setup("EURUSD", "long", 90), _setup("GBPUSD", "long", 80),
+              _setup("AUDUSD", "long", 70)]
+    assert len(_rank(setups, top=10, max_per_currency=2)) == 2
+    assert len(_rank(setups, top=10, max_per_currency=3)) == 3
+
+
+@pytest.mark.unit
+def test_an_ema_entry_does_not_count_as_confluence_with_itself():
+    from tradingagents.fx.scanner import _Context, _setups
+
+    # A steady climb has no swing lows, so the 1h 50 EMA is the only level.
+    n, step = 300, 0.0001
+    closes = [1.10 + step * i for i in range(n)]
+    idx = pd.date_range(end=NOW, periods=n, freq="1h", tz="UTC")
+    h1 = pd.DataFrame({"open": closes, "close": closes,
+                       "high": [c + 6 * step for c in closes],
+                       "low": [c - 6 * step for c in closes]}, index=idx)
+    mid = closes[-1]
+    context = _Context(spec=spec_for("EURUSD"), h1=h1, bias="long", trend_strength=3.0,
+                       atr1=float(ind.atr(h1).iloc[-1]),
+                       ema50_h1=float(ind.ema(h1["close"], 50).iloc[-1]),
+                       rsi_h1=55.0, mid=mid, spread=0.00005)
+
+    setups = _setups(context, 2.0, NOW + timedelta(hours=8))
+
+    assert setups, "the EMA pullback should still qualify as a setup"
+    assert all("coincide" not in " ".join(s.reasons) for s in setups)

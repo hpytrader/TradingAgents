@@ -48,9 +48,12 @@ MAX_ENTRY_ATR = 2.5       # farther than this and it is unlikely to fill in a se
 MAX_TARGET_ATR = 5.0      # an intraday move larger than this is a stretch
 MEASURED_R = 2.5          # target multiple when no swing level lies in the way
 ENTRY_BUFFER_ATR = 0.1    # front-run the level: orders cluster exactly on it
-STOP_BUFFER_ATR = 0.5     # beyond the level, past the noise that tags it
+STOP_BUFFER_ATR = 1.0     # beyond the level: a full hour's range, past the wicks that tag it
+MIN_STOP_SPREADS = 3      # a stop must be at least this many spreads beyond the level
 STALE_AFTER = timedelta(hours=3)   # newest H1 bar older than this: market closed
 MIN_TREND_ATR = 0.5       # EMAs closer than this (in H4 ATRs) are a range, not a trend
+FULL_TREND_ATR = 6.0      # EMA spread (H4 ATRs) that earns the full trend points
+FULL_LEVEL_VISITS = 6     # visits to a level that earn the full level points
 
 
 @dataclass
@@ -118,9 +121,14 @@ def scan(
     top: int = 10,
     max_per_currency: int = 2,
     valid_hours: float = 8.0,
+    stop_atr: float = STOP_BUFFER_ATR,
     now: datetime | None = None,
 ) -> ScanResult:
     """Scan ``symbols`` and return the best setup per instrument, ranked.
+
+    ``stop_atr`` places the stop that many 1-hour ATRs beyond the entry level.
+    A tighter stop shows a higher reward-to-risk on paper but is hit by
+    ordinary noise more often, so it does not make a setup better.
 
     ``candles`` and ``quote`` fetch the data (the OANDA vendor in normal use, a
     stub in tests), so the scanner itself never touches the network. A symbol
@@ -146,7 +154,7 @@ def scan(
         if isinstance(context, str):
             skipped.append((spec.symbol, context))
             continue
-        setups = _setups(context, min_rr, expires)
+        setups = _setups(context, min_rr, expires, stop_atr)
         if not setups:
             skipped.append((spec.symbol, f"{context.bias} trend, but no level with "
                             f"{min_rr:g}R room after the spread"))
@@ -211,7 +219,8 @@ def _context(spec: InstrumentSpec, candles: CandleFetcher, quote: QuoteFetcher,
     )
 
 
-def _setups(c: _Context, min_rr: float, expires: datetime) -> list[Setup]:
+def _setups(c: _Context, min_rr: float, expires: datetime,
+            stop_atr: float = STOP_BUFFER_ATR) -> list[Setup]:
     """Every qualifying limit entry for the context's trend direction."""
     long = c.bias == "long"
     sign = 1 if long else -1
@@ -229,7 +238,7 @@ def _setups(c: _Context, min_rr: float, expires: datetime) -> list[Setup]:
         if not (MIN_ENTRY_ATR * c.atr1 <= distance <= MAX_ENTRY_ATR * c.atr1):
             continue
         entry = level + sign * ENTRY_BUFFER_ATR * c.atr1
-        stop = level - sign * max(STOP_BUFFER_ATR * c.atr1, 1.5 * c.spread)
+        stop = level - sign * max(stop_atr * c.atr1, MIN_STOP_SPREADS * c.spread)
         risk = abs(entry - stop)
 
         target, target_kind = _target(c, entry, risk, opposing, min_rr, sign)
@@ -241,7 +250,12 @@ def _setups(c: _Context, min_rr: float, expires: datetime) -> list[Setup]:
             continue
 
         visits = ind.touches(recent, level, tolerance)
-        confluent = kind == "ema" or abs(level - c.ema50_h1) <= 0.5 * c.atr1
+        # Two independent reasons for price to stop at the same place. An EMA
+        # entry lines up with itself, so it needs a swing level nearby.
+        if kind == "ema":
+            confluent = any(abs(lvl - level) <= 0.5 * c.atr1 for lvl in levels)
+        else:
+            confluent = abs(level - c.ema50_h1) <= 0.5 * c.atr1
         score, reasons = _score(c, rr, visits, confluent, distance, target_kind, kind)
         spec = c.spec
         out.append(Setup(
@@ -288,17 +302,20 @@ def _score(c: _Context, rr: float, visits: int, confluent: bool, distance: float
            target_kind: str, level_kind: str) -> tuple[float, list[str]]:
     """Points out of 100, with the reason for each so a trader can check the work."""
     reasons = []
-    trend = min(c.trend_strength / 3, 1.0) * 25
+    # Full marks are meant to be rare: a 6-ATR EMA spread is a strong, mature
+    # trend, and six separate visits make a well-tested level. A score
+    # that most setups max out cannot rank them.
+    trend = min(c.trend_strength / FULL_TREND_ATR, 1.0) * 25
     reasons.append(f"4h {'up' if c.bias == 'long' else 'down'}trend, EMA spread "
                    f"{c.trend_strength:.1f}× ATR")
 
-    level = min(visits / 4, 1.0) * 20
+    level = min(visits / FULL_LEVEL_VISITS, 1.0) * 20
     what = "1h 50 EMA" if level_kind == "ema" else ("swing low" if c.bias == "long" else "swing high")
     reasons.append(f"entry at {what}, price returned to it {visits}× this week")
 
     ema_pts = 15 if confluent else 0
-    if confluent and level_kind != "ema":
-        reasons.append("level lines up with the 1h 50 EMA")
+    if confluent:
+        reasons.append("a swing level and the 1h 50 EMA coincide here")
 
     rr_pts = min(max(rr - 2, 0) / 2, 1.0) * 15
     reasons.append(f"{rr:.1f}R to a {target_kind} target after the spread")
