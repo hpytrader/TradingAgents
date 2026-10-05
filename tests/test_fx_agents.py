@@ -334,3 +334,60 @@ def test_agent_report_leads_with_the_final_orders(tmp_path):
     assert "no track record" in text
     data = json.loads(js.read_text(encoding="utf-8"))
     assert [o["symbol"] for o in data["review"]["orders"]] == ["EURUSD", "USDJPY"]
+
+
+QUOTA = RuntimeError("429 RESOURCE_EXHAUSTED. You exceeded your current quota "
+                     "{'error': {'code': 429, ... 'quotaValue': '20'}}")
+
+
+@pytest.mark.unit
+def test_the_fast_model_decides_when_the_strong_one_is_out_of_quota():
+    candidates = [_setup("EURUSD"), _setup("USDJPY", "short")]
+    quick, deep = _team(candidates)
+    quick.structured[ResearchVerdict] = deep.structured[ResearchVerdict]
+    quick.structured[FinalBook] = deep.structured[FinalBook]
+    deep.structured[ResearchVerdict] = QUOTA
+    deep.structured[FinalBook] = QUOTA
+
+    result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
+
+    assert [o.symbol for o in result.orders] == ["EURUSD", "USDJPY"]
+    assert all(o.conviction == "medium" for o in result.orders)       # a real decision
+    assert result.problems == ["Research manager: daily quota used up",
+                               "Portfolio manager: daily quota used up"]
+    assert all("decided by the fast model (strong model: daily quota used up)" in f
+               for f in result.fallbacks)
+    assert not any("no usable answer" in f for f in result.fallbacks)
+
+
+@pytest.mark.unit
+def test_a_failed_text_agent_does_not_stop_the_review():
+    candidates = [_setup("EURUSD")]
+    quick, deep = _team(candidates)
+    calls = {"n": 0}
+    original = quick.invoke
+
+    def flaky(prompt):
+        calls["n"] += 1
+        if "MACRO ANALYST" in prompt:
+            raise TimeoutError("read timed out")
+        return original(prompt)
+    quick.invoke = flaky
+
+    result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
+
+    assert len(result.orders) == 1
+    assert result.problems == ["Macro analyst: the model timed out"]
+    assert "unavailable" in result.transcript["Macro analyst"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("message, reason", [
+    ("429 RESOURCE_EXHAUSTED quota exceeded", "daily quota used up"),
+    ("Error code: 429 - rate limit reached", "rate-limited by the provider"),
+    ("Error code: 401 - Incorrect API key provided", "API key refused"),
+    ("Request timed out.", "the model timed out"),
+    ("something odd\nwith detail", "something odd"),
+])
+def test_provider_errors_become_one_line(message, reason):
+    assert fx_agents.short_reason(RuntimeError(message)) == reason

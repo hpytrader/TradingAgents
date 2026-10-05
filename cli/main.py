@@ -234,6 +234,22 @@ def _print_scan(result, quiet: bool = False):
             console.print(f"[dim]{symbol}: {reason}[/dim]")
 
 
+def _quiet_fx_logs():
+    """Hide library chatter during the review; its problems are reported in one line each.
+
+    Yahoo's "no news" warnings and Google's notes to developers would otherwise
+    print over the progress spinner, and a quota error would print its whole
+    JSON payload.
+    """
+    import logging
+    import warnings
+
+    for name in ("tradingagents.dataflows.router", "tradingagents.agents.structured",
+                 "google_genai", "google_genai.models", "google.genai", "httpx", "yfinance"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", module=r"google\..*")
+
+
 def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
     """Stage 2: the agent team reviews the candidates. Returns the Review, or exits."""
     from datetime import UTC, datetime
@@ -249,6 +265,7 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
         console.print("[yellow]No candidates, so there is nothing for the agents to review.[/yellow]")
         return fx_agents.Review(orders=[], dropped=[], summary="The scanner found no candidates.")
 
+    _quiet_fx_logs()
     stats = StatsCallbackHandler()
     try:
         quick = create_tier_client(DEFAULT_CONFIG, "quick", callbacks=[stats]).get_llm()
@@ -274,8 +291,15 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
 
     if context.calendar_note:
         console.print(f"[yellow]{context.calendar_note}[/yellow]")
+    missing_news = [sym for sym, text in context.news.items() if text.startswith("(news unavailable")]
+    if missing_news:
+        console.print(f"[dim]No headlines found for {', '.join(missing_news)}; the agents were told so.[/dim]")
+    for problem in review.problems:
+        console.print(f"[yellow]Model problem: {problem}[/yellow]")
     for note in review.fallbacks:
         console.print(f"[yellow]Partial review: {note}[/yellow]")
+    if any("quota" in p for p in review.problems):
+        console.print("[dim]A free-tier daily quota resets after about 24 hours; a paid key removes the limit.[/dim]")
 
     if review.orders:
         table = Table(title=f"Final orders ({len(review.orders)} of up to {final})")

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from tradingagents.agents.structured import NO_EXTERNAL_TOOLS, bind_structured, invoke_structured
+from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 from tradingagents.fx.context import ReviewContext
 from tradingagents.fx.scanner import Setup
 from tradingagents.fx.schemas import FinalBook, ResearchVerdict, TraderPlan
@@ -46,6 +46,7 @@ class Review:
     summary: str
     transcript: dict[str, str] = field(default_factory=dict)   # agent → what it said
     fallbacks: list[str] = field(default_factory=list)         # agents whose output was replaced
+    problems: list[str] = field(default_factory=list)          # one-line reason per failed call
 
     def to_dict(self) -> dict:
         return {
@@ -54,6 +55,7 @@ class Review:
             "summary": self.summary,
             "transcript": self.transcript,
             "fallbacks": self.fallbacks,
+            "problems": self.problems,
         }
 
 
@@ -126,6 +128,50 @@ def _say(llm: Any, prompt: str) -> str:
     return _text(llm.invoke(prompt))
 
 
+def _heard(agent: str, call: Callable[[], str], problems: list[str]) -> str:
+    """Run a free-text agent; on failure note it and let the review carry on."""
+    try:
+        return call()
+    except Exception as exc:
+        reason = short_reason(exc)
+        logger.info("%s failed: %s", agent, exc)
+        problems.append(f"{agent}: {reason}")
+        return f"({agent} unavailable: {reason})"
+
+
+def short_reason(exc: BaseException) -> str:
+    """One line a trader can act on, instead of a provider's full error payload."""
+    text = str(exc)
+    lowered = text.lower()
+    if "resource_exhausted" in lowered or "quota" in lowered:
+        return "daily quota used up"
+    if "429" in text or "rate limit" in lowered or "rate_limit" in lowered:
+        return "rate-limited by the provider"
+    if "401" in text or "api key" in lowered or "unauthorized" in lowered or "authentication" in lowered:
+        return "API key refused"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "the model timed out"
+    first = text.strip().splitlines()[0] if text.strip() else type(exc).__name__
+    return first[:120]
+
+
+def _structured(llm: Any, schema: type, prompt: str, agent: str,
+                errors: list[str] | None) -> Any | None:
+    """A typed answer from ``llm``, or ``None`` with a one-line reason in ``errors``."""
+    try:
+        answer = llm.with_structured_output(schema).invoke(prompt)
+    except Exception as exc:
+        reason = short_reason(exc)
+        logger.info("%s: structured answer failed: %s", agent, exc)
+    else:
+        if isinstance(answer, schema):
+            return answer
+        reason = "the model returned no usable answer"
+    if errors is not None:
+        errors.append(f"{agent}: {reason}")
+    return None
+
+
 def macro_analyst(llm, candidates, ctx) -> str:
     return _say(llm, f"""{GROUND_RULES}
 
@@ -159,9 +205,9 @@ Use only the evidence given. Two to four sentences per candidate, then one line 
 {evidence(candidates, ctx)}""")
 
 
-def research_manager(llm, candidates, ctx, macro, bull, bear) -> ResearchVerdict | None:
-    structured = bind_structured(llm, ResearchVerdict, "FX Research Manager")
-    return invoke_structured(structured, f"""{GROUND_RULES}
+def research_manager(llm, candidates, ctx, macro, bull, bear,
+                     errors: list[str] | None = None) -> ResearchVerdict | None:
+    return _structured(llm, ResearchVerdict, f"""{GROUND_RULES}
 
 You are the RESEARCH MANAGER. Judge the bull and bear cases for each candidate and decide \
 which go to the trader. Drop a setup when the bear case is stronger, above all when a \
@@ -177,12 +223,11 @@ out. Keeping none is acceptable on a bad day. Return a verdict for every candida
 ## Bear case
 {bear}
 
-{evidence(candidates, ctx)}""", "FX Research Manager")
+{evidence(candidates, ctx)}""", "Research manager", errors)
 
 
-def trader(llm, kept, ctx, verdict_text: str) -> TraderPlan | None:
-    structured = bind_structured(llm, TraderPlan, "FX Trader")
-    return invoke_structured(structured, f"""{GROUND_RULES}
+def trader(llm, kept, ctx, verdict_text: str, errors: list[str] | None = None) -> TraderPlan | None:
+    return _structured(llm, TraderPlan, f"""{GROUND_RULES}
 
 You are the TRADER. For each setup the research manager kept, write the order. Keep the \
 scanner's entry, stop and target unless the debate gives a concrete reason to change them, \
@@ -194,7 +239,7 @@ stays at or above the minimum. An order breaking a rule reverts to the scanner's
 ## Research manager's verdict
 {verdict_text}
 
-{evidence(kept, ctx)}""", "FX Trader")
+{evidence(kept, ctx)}""", "Trader", errors)
 
 
 def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx) -> str:
@@ -221,9 +266,8 @@ Time now: {ctx.now:%A %H:%M} UTC""")
 
 
 def portfolio_manager(llm, plan_text, risk_views, macro, ctx, max_orders, max_per_currency,
-                      min_rr) -> FinalBook | None:
-    structured = bind_structured(llm, FinalBook, "FX Portfolio Manager")
-    return invoke_structured(structured, f"""{GROUND_RULES}
+                      min_rr, errors: list[str] | None = None) -> FinalBook | None:
+    return _structured(llm, FinalBook, f"""{GROUND_RULES}
 
 You are the PORTFOLIO MANAGER and make the final call. From the trader's book, choose at \
 most {max_orders} limit orders. At most {max_per_currency} may be long, or short, the same \
@@ -249,7 +293,7 @@ a rule reverts to the scanner's levels or is dropped.
 ### Conservative
 {risk_views['conservative']}
 
-Time now: {ctx.now:%A %H:%M} UTC""", "FX Portfolio Manager")
+Time now: {ctx.now:%A %H:%M} UTC""", "Portfolio manager", errors)
 
 
 # ---------------------------------------------------------------------------
@@ -307,22 +351,34 @@ def review(
     transcript: dict[str, str] = {}
     fallbacks: list[str] = []
     dropped: list[tuple[str, str]] = []
+    problems: list[str] = []          # one-line reasons, collected as agents fail
+
+    def decide(make, label):
+        """Strong model first, then the fast one: they often have separate quotas."""
+        answer = make(deep_llm)
+        if answer is None and quick_llm is not deep_llm:
+            answer = make(quick_llm)
+            if answer is not None:
+                fallbacks.append(f"{label}: decided by the fast model (strong model: "
+                                 f"{problems[-1].split(': ', 1)[-1]})")
+        return answer
 
     if not candidates:
         return Review(orders=[], dropped=[], summary="The scanner found no candidates to review.")
 
     step("Macro analyst reading the calendar and headlines")
-    macro = macro_analyst(quick_llm, candidates, ctx)
+    macro = _heard("Macro analyst", lambda: macro_analyst(quick_llm, candidates, ctx), problems)
     transcript["Macro analyst"] = macro
 
     step("Bull and bear researchers debating the setups")
-    bull = researcher(quick_llm, "bull", candidates, ctx, macro)
-    bear = researcher(quick_llm, "bear", candidates, ctx, macro)
+    bull = _heard("Bull researcher", lambda: researcher(quick_llm, "bull", candidates, ctx, macro), problems)
+    bear = _heard("Bear researcher", lambda: researcher(quick_llm, "bear", candidates, ctx, macro), problems)
     transcript["Bull researcher"] = bull
     transcript["Bear researcher"] = bear
 
     step("Research manager judging the debate")
-    verdict = research_manager(deep_llm, candidates, ctx, macro, bull, bear)
+    verdict = decide(lambda llm: research_manager(llm, candidates, ctx, macro, bull, bear, problems),
+                     "Research manager")
     if verdict is None:
         fallbacks.append("Research manager: no usable answer; every candidate passed to the trader")
         kept = list(candidates)
@@ -339,10 +395,11 @@ def review(
 
     if not kept:
         return Review(orders=[], dropped=dropped, transcript=transcript, fallbacks=fallbacks,
+                      problems=problems,
                       summary=verdict.summary if verdict else "No setups survived the debate.")
 
     step("Trader writing the orders")
-    plan = trader(quick_llm, kept, ctx, verdict_text)
+    plan = trader(quick_llm, kept, ctx, verdict_text, problems)
     kept_symbols = {s.symbol for s in kept}
     if plan is None:
         fallbacks.append("Trader: no usable answer; scanner levels used")
@@ -358,14 +415,17 @@ def review(
     transcript["Trader"] = plan_text
 
     step("Risk team reviewing the book")
-    risk_views = {stance: risk_analyst(quick_llm, stance, plan_text, macro, ctx)
+    risk_views = {stance: _heard(f"{stance.title()} risk analyst",
+                                 lambda stance=stance: risk_analyst(quick_llm, stance, plan_text, macro, ctx),
+                                 problems)
                   for stance in ("aggressive", "neutral", "conservative")}
     for stance, said in risk_views.items():
         transcript[f"{stance.title()} risk analyst"] = said
 
     step("Portfolio manager choosing the final orders")
-    book = portfolio_manager(deep_llm, plan_text, risk_views, macro, ctx,
-                             max_orders, max_per_currency, min_rr)
+    book = decide(lambda llm: portfolio_manager(llm, plan_text, risk_views, macro, ctx,
+                                                max_orders, max_per_currency, min_rr, problems),
+                  "Portfolio manager")
     if book is None:
         fallbacks.append("Portfolio manager: no usable answer; the trader's book ranked by "
                          "scanner score was used, all at low conviction")
@@ -388,4 +448,4 @@ def review(
                                 max_orders=max_orders, max_per_currency=max_per_currency)
     dropped += [(sym, f"failed verification: {why}") for sym, why in rejected]
     return Review(orders=accepted, dropped=dropped, summary=summary,
-                  transcript=transcript, fallbacks=fallbacks)
+                  transcript=transcript, fallbacks=fallbacks, problems=problems)
