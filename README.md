@@ -356,6 +356,19 @@ ta = TradingAgentsGraph(config=config)
 _, decision = ta.propagate("NVDA", "2026-09-01")
 ```
 
+## Forex and metals scanner
+
+`tradingagents fx-scan` looks for intraday limit-order setups across seven major pairs, five crosses, gold and silver, using spot prices from OANDA. It runs no AI and costs nothing: it is the first stage of a morning scan whose candidates the agents will review.
+
+```bash
+tradingagents fx-scan                              # default instruments, RR ≥ 2, top 10
+tradingagents fx-scan --symbols EURUSD,XAUUSD --min-rr 2.5 --top 6
+```
+
+For each instrument it requires a clear 4-hour trend (price, 50 EMA and 200 EMA stacked, the 50 sloping with it), finds a 1-hour swing level or the 1-hour 50 EMA that a pullback could reach within 0.3–2.5 ATR, and places a limit just ahead of it with the stop beyond. The target is the nearest intact 1-hour swing on the other side paying the minimum reward-to-risk after the spread, or 2.5R when price is at new extremes. The list holds at most two trades long or short the same currency. Each setup is scored out of 100 for ranking; the score is not a win probability.
+
+It needs `OANDA_API_TOKEN` (a free practice account's token reads live prices) and saves each scan to `<results_dir>/fx_scans/` as Markdown and JSON.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.
