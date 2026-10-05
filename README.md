@@ -369,6 +369,21 @@ For each instrument it requires a clear 4-hour trend (price, 50 EMA and 200 EMA 
 
 It needs `OANDA_API_TOKEN` (a free practice account's token reads live prices) and saves each scan to `<results_dir>/fx_scans/` as Markdown and JSON.
 
+### Agent review
+
+`tradingagents fx-scan --agents` passes the candidates to an agent team built on the same roles as the stock pipeline and picks up to six final limit orders (`--final` to change):
+
+1. **Macro analyst** reads this week's economic calendar (high- and medium-impact releases per currency, gold and silver as USD) and the latest headlines, and briefs the desk on each currency's driver and event risk.
+2. **Bull and bear researchers** argue for and against every setup.
+3. **Research manager** (deep model) decides which survive the debate, dropping setups exposed to a release before they would play out.
+4. **Trader** writes the orders, keeping the scanner's levels unless the debate gives a reason to move them.
+5. **Aggressive, neutral and conservative risk analysts** review the book as a whole: shared currencies, correlated pairs, orders that could fill into the same release.
+6. **Portfolio manager** (deep model) chooses the final book and each order's cancel time.
+
+Every agent sees all candidates at once, so a review is nine model calls whatever the number of candidates. The final orders are then checked in code against the scanner's facts: the right side of price, an entry within 1.5 ATR of the scanner's level, a stop at least 0.5 ATR away, the minimum RR after the spread, and the per-currency cap. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.
+
+The review uses the provider and models set in `.env` (`TRADINGAGENTS_LLM_PROVIDER` and the quick and deep models). The economic calendar is the Forex Factory weekly feed, cached for an hour; when it cannot be read, the agents are told event risk is unknown rather than absent.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.
