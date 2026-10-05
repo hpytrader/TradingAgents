@@ -161,7 +161,7 @@ def fx_scan(
     symbols: str = typer.Option(
         None, "--symbols", help="Comma-separated pairs, e.g. EURUSD,XAUUSD; omit for the default majors, crosses and metals"
     ),
-    top: int = typer.Option(10, "--top", help="How many setups to keep"),
+    top: int = typer.Option(10, "--top", help="How many setups the scanner keeps"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     valid_hours: float = typer.Option(8.0, "--valid-hours", help="Hours before an unfilled limit order should be cancelled"),
     max_per_currency: int = typer.Option(
@@ -170,19 +170,21 @@ def fx_scan(
     stop_atr: float = typer.Option(
         1.0, "--stop-atr", help="Stop distance beyond the entry level, in 1-hour ATRs"
     ),
+    agents: bool = typer.Option(
+        False, "--agents", help="Have the AI agent team review the candidates and pick the final orders (uses your AI key)"
+    ),
+    final: int = typer.Option(6, "--final", help="With --agents: the most orders in the final book"),
     save: bool = typer.Option(True, "--save/--no-save", help="Save the scan as Markdown and JSON"),
 ):
-    """Scan forex and metals for intraday limit-order setups (no AI, uses OANDA prices)."""
-    from rich.table import Table
-
+    """Scan forex and metals for intraday limit-order setups (OANDA prices; --agents adds the AI review)."""
     from tradingagents.dataflows.errors import VendorNotConfiguredError
     from tradingagents.dataflows.vendors import oanda
     from tradingagents.fx import DEFAULT_UNIVERSE, scan
-    from tradingagents.fx.report import DISCLAIMER, save as save_scan
+    from tradingagents.fx.report import AGENT_DISCLAIMER, DISCLAIMER, save as save_scan
 
     names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
-    if max_per_currency < 1 or stop_atr <= 0 or top < 1:
-        console.print("[red]--max-per-currency and --top must be at least 1, and --stop-atr above 0.[/red]")
+    if max_per_currency < 1 or stop_atr <= 0 or top < 1 or final < 1:
+        console.print("[red]--max-per-currency, --top and --final must be at least 1, and --stop-atr above 0.[/red]")
         raise typer.Exit(code=1)
     try:
         oanda.get_quote(names[0])          # fail fast on a missing or refused token
@@ -192,13 +194,32 @@ def fx_scan(
     except Exception:
         pass                               # a problem with one pair is reported by the scan
 
+    # The agents choose from a wider field than the final book allows, so a
+    # setup they reject can be replaced; the book's own cap is enforced later.
+    scan_top = max(top, final + 4) if agents else top
+    scan_cap = max_per_currency + 1 if agents else max_per_currency
     with console.status(f"Scanning {len(names)} instruments..."):
         result = scan(oanda.get_candles, oanda.get_quote, names,
-                      min_rr=min_rr, top=top, valid_hours=valid_hours,
-                      max_per_currency=max_per_currency, stop_atr=stop_atr)
+                      min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
+                      max_per_currency=scan_cap, stop_atr=stop_atr)
 
+    _print_scan(result, quiet=agents)
+    review = None
+    if agents:
+        review = _run_fx_agents(result, final=final, max_per_currency=max_per_currency, min_rr=min_rr)
+    console.print(f"\n[dim]{AGENT_DISCLAIMER if agents else DISCLAIMER}[/dim]")
+
+    if save:
+        md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], review)
+        console.print(f"Saved: {md}")
+
+
+def _print_scan(result, quiet: bool = False):
+    from rich.table import Table
+
+    title = "Scanner candidates" if quiet else "Setups"
     if result.setups:
-        table = Table(title=f"Setups — {result.scanned_at:%Y-%m-%d %H:%M} UTC")
+        table = Table(title=f"{title} — {result.scanned_at:%Y-%m-%d %H:%M} UTC")
         for column in ("#", "Symbol", "Order", "Entry", "Stop", "Target", "RR", "Risk pips", "Score"):
             table.add_column(column, justify="right" if column not in ("Symbol", "Order") else "left")
         for i, s in enumerate(result.setups, 1):
@@ -208,13 +229,79 @@ def fx_scan(
         console.print(table)
     else:
         console.print("[yellow]No setups met the rules right now.[/yellow]")
-    for symbol, reason in result.skipped:
-        console.print(f"[dim]{symbol}: {reason}[/dim]")
-    console.print(f"\n[dim]{DISCLAIMER}[/dim]")
+    if not quiet:
+        for symbol, reason in result.skipped:
+            console.print(f"[dim]{symbol}: {reason}[/dim]")
 
-    if save:
-        md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"])
-        console.print(f"Saved: {md}")
+
+def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
+    """Stage 2: the agent team reviews the candidates. Returns the Review, or exits."""
+    from datetime import UTC, datetime
+
+    from rich.table import Table
+
+    from cli.stats_handler import StatsCallbackHandler
+    from tradingagents.fx import agents as fx_agents
+    from tradingagents.fx.context import gather
+    from tradingagents.llm_clients.factory import create_tier_client
+
+    if not result.setups:
+        console.print("[yellow]No candidates, so there is nothing for the agents to review.[/yellow]")
+        return fx_agents.Review(orders=[], dropped=[], summary="The scanner found no candidates.")
+
+    stats = StatsCallbackHandler()
+    try:
+        quick = create_tier_client(DEFAULT_CONFIG, "quick", callbacks=[stats]).get_llm()
+        deep = create_tier_client(DEFAULT_CONFIG, "deep", callbacks=[stats]).get_llm()
+    except Exception as exc:
+        console.print(f"[red]Could not start the AI models: {exc}[/red]")
+        console.print("[dim]Check the provider, models and API key in your .env file.[/dim]")
+        raise typer.Exit(code=1) from None
+
+    now = datetime.now(UTC)
+    with console.status("Reading the economic calendar and headlines...") as status:
+        context = gather(result.setups, now)
+        try:
+            review = fx_agents.review(
+                result.setups, context, quick, deep,
+                max_orders=final, max_per_currency=max_per_currency, min_rr=min_rr,
+                progress=lambda msg: status.update(f"{msg}..."), now=now,
+            )
+        except Exception as exc:
+            console.print(f"[red]The agent review stopped: {exc}[/red]")
+            console.print("[dim]The scanner candidates above are still valid; the report is saved without the review.[/dim]")
+            return None
+
+    if context.calendar_note:
+        console.print(f"[yellow]{context.calendar_note}[/yellow]")
+    for note in review.fallbacks:
+        console.print(f"[yellow]Partial review: {note}[/yellow]")
+
+    if review.orders:
+        table = Table(title=f"Final orders ({len(review.orders)} of up to {final})")
+        for column in ("#", "Symbol", "Order", "Entry", "Stop", "Target", "RR", "Cancel by", "Conviction"):
+            table.add_column(column, justify="right" if column not in ("Symbol", "Order", "Conviction") else "left")
+        for i, o in enumerate(review.orders, 1):
+            colour = "green" if o.direction == "long" else "red"
+            table.add_row(str(i), o.symbol, f"[{colour}]{o.order_type}[/{colour}]", str(o.entry),
+                          str(o.stop), str(o.target), f"{o.rr:.2f}",
+                          f"{o.expires_at:%H:%M} UTC", o.conviction)
+        console.print(table)
+        for i, o in enumerate(review.orders, 1):
+            console.print(f"[bold]{i}. {o.symbol}[/bold] {o.rationale}")
+            console.print(f"   [dim]Watch for: {o.watch_for}[/dim]")
+            for note in o.notes:
+                console.print(f"   [yellow]{note}[/yellow]")
+    else:
+        console.print("[yellow]The agents chose no orders today.[/yellow]")
+    console.print(f"\n{review.summary}")
+    for symbol, reason in review.dropped:
+        console.print(f"[dim]{symbol}: {reason}[/dim]")
+
+    used = stats.get_stats()
+    console.print(f"\n[dim]AI usage: {used['llm_calls']} calls, {used['tokens_in']:,} tokens in, "
+                  f"{used['tokens_out']:,} out[/dim]")
+    return review
 
 
 if __name__ == "__main__":
