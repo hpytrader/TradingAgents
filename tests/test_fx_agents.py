@@ -502,3 +502,22 @@ def test_ticketed_verdicts_reach_the_book():
     assert [o.symbol for o in result.orders] == ["EURUSD"]
     assert dict(result.dropped)["USDJPY"] == "research manager: against the trend"
     assert "no verdict given" not in str(result.dropped)
+
+
+@pytest.mark.unit
+def test_the_risk_team_is_told_what_was_already_dropped():
+    candidates = [_setup("EURUSD"), _setup("USDJPY", "short")]
+    quick, deep = _team(candidates, keep=["EURUSD"])
+    fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW,
+                     tickets={"EURUSD": "#1032", "USDJPY": "#1031"})
+    risk = [p for p in quick.prompts if "RISK ANALYST" in p]
+    pm = [p for p in deep.prompts if "PORTFOLIO MANAGER" in p]
+    for prompt in risk + pm:
+        assert "Already dropped by the research manager (not orders; do not review them): #1031 USDJPY" in prompt
+
+
+@pytest.mark.unit
+def test_the_desk_rules_name_the_trade_manager_and_the_2pm_cancel():
+    text = fx_agents.GROUND_RULES
+    assert "only the trade manager may change it" in text and "14:00 New York at the latest" in text
+    assert "managed only by its stop and target" not in text

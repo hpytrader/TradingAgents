@@ -174,7 +174,10 @@ def fx_scan(
         False, "--any-session", help="smc: scan outside the window too"
     ),
     valid_hours: float = typer.Option(
-        None, "--valid-hours", help="Hours before an unfilled limit order is cancelled (smc: 4, capped at the window's close; trend: 8)"
+        None, "--valid-hours", help="Hours before an unfilled limit order is cancelled (smc: 4, and by --latest-cancel; trend: 8)"
+    ),
+    latest_cancel: str = typer.Option(
+        "14:00", "--latest-cancel", help="smc: cancel unfilled orders by this New York time at the latest"
     ),
     max_per_currency: int = typer.Option(
         2, "--max-per-currency", help="Most setups long, or short, the same currency (e.g. 3 on a strong-dollar day)"
@@ -201,6 +204,7 @@ def fx_scan(
     except ValueError as exc:
         console.print(f"[red]--window: {exc}[/red]")
         raise typer.Exit(code=1) from None
+    cancel_by = _parse_clock(latest_cancel, "--latest-cancel")
     from tradingagents.dataflows.errors import VendorNotConfiguredError
     from tradingagents.dataflows.vendors import oanda
     from tradingagents.fx import DEFAULT_UNIVERSE, scan
@@ -228,7 +232,7 @@ def fx_scan(
             result = scan_smc(oanda.get_candles, oanda.get_quote, names,
                               min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
                               max_per_currency=scan_cap, window=scan_window,
-                              any_session=any_session)
+                              any_session=any_session, latest_cancel=cancel_by)
         else:
             result = scan(oanda.get_candles, oanda.get_quote, names,
                           min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
@@ -268,6 +272,16 @@ def fx_scan(
             console.print(f"Journal: {', '.join(e.label for e in added) or 'no new orders'}"
                           + (f" ({repeat} already pending or open)" if repeat else ""))
         console.print("Desk chat saved: see it with tradingagents fx-journal --open")
+
+
+def _parse_clock(text: str, flag: str):
+    from datetime import time
+
+    try:
+        return time.fromisoformat(text.strip())
+    except ValueError:
+        console.print(f"[red]{flag} must be a time like 14:00, not {text!r}.[/red]")
+        raise typer.Exit(code=1) from None
 
 
 def _fx_journal():
@@ -409,6 +423,7 @@ def fx_watch(
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     max_per_currency: int = typer.Option(2, "--max-per-currency", help="Most orders long, or short, one currency"),
     window: str = typer.Option("02:00-12:00", "--window", help="Hours to build setups in, New York (= Toronto) time"),
+    latest_cancel: str = typer.Option("14:00", "--latest-cancel", help="Cancel unfilled orders by this New York time at the latest"),
     symbols: str = typer.Option(None, "--symbols", help="Comma-separated pairs; omit for the default list"),
     open_page: bool = typer.Option(False, "--open", help="Open the dashboard in your browser at the start"),
 ):
@@ -430,6 +445,7 @@ def fx_watch(
     except ValueError as exc:
         console.print(f"[red]--window: {exc}[/red]")
         raise typer.Exit(code=1) from None
+    cancel_by = _parse_clock(latest_cancel, "--latest-cancel")
     if interval < 1 or max_agent_runs < 0 or final < 1 or max_per_currency < 1 or ward_every < 0:
         console.print("[red]--interval and --final must be at least 1; --max-agent-runs and --ward-every at least 0.[/red]")
         raise typer.Exit(code=1)
@@ -448,7 +464,8 @@ def fx_watch(
 
     def scan_fn(now):
         return scan_smc(oanda.get_candles, oanda.get_quote, names, min_rr=min_rr, top=final + 4,
-                        max_per_currency=max_per_currency + 1, window=scan_window, now=now)
+                        max_per_currency=max_per_currency + 1, window=scan_window, now=now,
+                        latest_cancel=cancel_by)
 
     models: dict = {}
     review_fn = _fx_reviewer(final=final, max_per_currency=max_per_currency, min_rr=min_rr, models=models)
