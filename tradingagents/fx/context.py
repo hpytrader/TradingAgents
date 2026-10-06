@@ -21,6 +21,7 @@ from tradingagents.fx.scanner import Setup
 RECENT_EVENTS = timedelta(hours=12)
 NEWS_DAYS = 2
 HEADLINE_HOURS = 12
+LATER_WINDOW = timedelta(days=5)
 
 
 @dataclass
@@ -28,6 +29,7 @@ class ReviewContext:
     now: datetime
     upcoming: dict[str, list[Event]] = field(default_factory=dict)   # per symbol, until expiry
     recent: list[Event] = field(default_factory=list)                # released in the last 12h
+    later: list[Event] = field(default_factory=list)                 # high impact, after today's close
     calendar_note: str = ""                                          # set when the calendar is unknown
     news: dict[str, str] = field(default_factory=dict)               # per symbol
     global_news: str = ""
@@ -81,6 +83,11 @@ def gather(
         currencies = set().union(*(forex_calendar.currencies_for(s.symbol) for s in candidates)) \
             if candidates else set()
         ctx.recent = calendar(now - RECENT_EVENTS, now, currencies)
+        # The rest of the week's high-impact releases, so a headline about
+        # "Fed minutes ahead" can be placed in time instead of read as a risk
+        # of unknown timing. They fall after the close, so no trade today faces them.
+        close = day_close(now)
+        ctx.later = [e for e in calendar(close, close + LATER_WINDOW, currencies) if e.impact == "High"]
     except Exception as exc:
         ctx.upcoming = {}
         ctx.recent = []

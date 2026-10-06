@@ -40,6 +40,8 @@ time (no later than the end of the morning scan window, 12:00 New York by defaul
 earlier for a release. A filled trade is \
 managed only by its stop and target and is closed at the New York 17:00 close (21:00 UTC in \
 summer, 22:00 UTC in winter) at the latest; nothing is held overnight.
+A release after today's New York close cannot affect any of today's orders or trades: when a \
+headline mentions an event, find its time in the calendar before treating it as a risk.
 Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
 previous values but never the actual result; an actual figure is known only if a headline \
 reports it. A rule-based scanner found the candidates; its levels and figures are facts. Your \
@@ -123,6 +125,10 @@ def macro_evidence(candidates: list[Setup], ctx: ReviewContext) -> str:
         upcoming = sorted({e for evs in ctx.upcoming.values() for e in evs}, key=lambda e: e.time)
         parts += [f"- {e.describe()}" for e in upcoming] or ["- nothing high or medium impact"]
         parts.append("")
+        if ctx.later:
+            parts.append("## Later this week: after today's New York close, so no effect on today's trades")
+            parts += [f"- {e.describe()}" for e in ctx.later[:12]]
+            parts.append("")
     parts += ["## Candidates and live trades"]
     for s in candidates:
         ticket = ctx.tickets.get(s.symbol, "") or getattr(s, "ticket", "")
