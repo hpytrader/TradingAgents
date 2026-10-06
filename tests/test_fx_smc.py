@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from tradingagents.fx import smc
-from tradingagents.fx.smc_scanner import active_session, scan_smc
+from tradingagents.fx.smc_scanner import ScanWindow, market_open, scan_smc
 from tradingagents.fx.verify import check_levels, verify
 
 NOW = datetime(2026, 10, 6, 8, 30, tzinfo=UTC)          # 09:30 in London
@@ -168,14 +168,54 @@ def test_trading_days_roll_at_new_york_five_pm():
     assert smc.trading_day(after) == smc.trading_day(before) + timedelta(days=1)
 
 
+def _ny(y, m, d, hh, mm=0):
+    from tradingagents.fx.smc import NEW_YORK
+    return NEW_YORK.localize(datetime(y, m, d, hh, mm)).astimezone(UTC)
+
+
 @pytest.mark.unit
-def test_sessions_follow_local_clocks():
-    assert active_session(NOW)[0].name == "London"
-    assert active_session(datetime(2026, 10, 6, 13, 0, tzinfo=UTC))[0].name == "New York"
-    assert active_session(datetime(2026, 10, 6, 18, 0, tzinfo=UTC)) is None
-    # After the clocks change, London's 07:00 is 07:00 UTC, not 06:00.
-    assert active_session(datetime(2026, 11, 3, 6, 30, tzinfo=UTC)) is None
-    assert active_session(datetime(2026, 11, 3, 7, 30, tzinfo=UTC))[0].name == "London"
+def test_the_default_window_is_two_am_to_noon_new_york():
+    w = ScanWindow()
+    assert w.current_end(_ny(2026, 10, 6, 6, 11)) == _ny(2026, 10, 6, 12)   # Tuesday 06:11: inside
+    assert w.current_end(_ny(2026, 10, 6, 2, 0)) is not None                 # opens at 02:00
+    assert w.current_end(_ny(2026, 10, 6, 1, 59)) is None
+    assert w.current_end(_ny(2026, 10, 6, 12, 0)) is None                    # closes at 12:00
+    assert w.next_open(_ny(2026, 10, 6, 12, 30)) == _ny(2026, 10, 7, 2)
+
+
+@pytest.mark.unit
+def test_the_window_follows_new_york_clocks_through_daylight_saving():
+    w = ScanWindow()
+    assert w.next_open(_ny(2026, 10, 6, 13)) == datetime(2026, 10, 7, 6, 0, tzinfo=UTC)   # EDT
+    assert w.next_open(_ny(2026, 11, 3, 13)) == datetime(2026, 11, 4, 7, 0, tzinfo=UTC)   # EST
+
+
+@pytest.mark.unit
+def test_weekends_are_never_in_the_window():
+    w = ScanWindow()
+    assert not market_open(_ny(2026, 10, 9, 17, 0))          # Friday 17:00
+    assert not market_open(_ny(2026, 10, 10, 6, 0))          # Saturday
+    assert not market_open(_ny(2026, 10, 11, 16, 59))        # Sunday before the open
+    assert market_open(_ny(2026, 10, 11, 17, 0))
+    assert w.current_end(_ny(2026, 10, 10, 6, 0)) is None
+    assert w.next_open(_ny(2026, 10, 9, 13, 0)) == _ny(2026, 10, 12, 2)    # Friday → Monday
+
+
+@pytest.mark.unit
+def test_a_window_may_cross_midnight():
+    w = ScanWindow.parse("19:00-12:00")
+    assert w.current_end(_ny(2026, 10, 6, 23, 0)) == _ny(2026, 10, 7, 12)
+    assert w.current_end(_ny(2026, 10, 7, 3, 0)) == _ny(2026, 10, 7, 12)
+    assert w.current_end(_ny(2026, 10, 7, 15, 0)) is None
+    assert w.current_end(_ny(2026, 10, 11, 19, 0)) is not None   # Sunday evening, market open
+    assert w.current_end(_ny(2026, 10, 9, 19, 0)) is None        # Friday evening, market shut
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", ["2-12", "02:00", "12:00-12:00", "25:00-12:00"])
+def test_bad_windows_are_refused(text):
+    with pytest.raises(ValueError):
+        ScanWindow.parse(text)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +237,8 @@ def test_textbook_long_is_found():
     assert s.rr >= 2.0
     text = " ".join(s.reasons)
     assert "Asian low" in text and "structure shift" in text and "inside the order block" in text
-    assert s.expires_at == datetime(2026, 10, 6, 10, 0, tzinfo=UTC)  # 11:00 London
+    assert s.expires_at == NOW + timedelta(hours=4)                   # before the 12:00 close
+    assert "London session" in text
 
 
 @pytest.mark.unit
@@ -266,11 +307,20 @@ def test_a_stop_is_never_closer_than_the_noise(monkeypatch):
 
 
 @pytest.mark.unit
-def test_outside_the_sessions_nothing_is_built_unless_asked():
+def test_outside_the_window_nothing_is_built_unless_asked():
     candles, quote = _fetchers(_m5(), _h1())
-    later = NOW + timedelta(hours=8)                         # 16:30 UTC, between sessions
+    later = NOW + timedelta(hours=8)                         # 12:30 New York
     result = scan_smc(candles, quote, ["EURUSD"], now=later)
-    assert result.setups == [] and "outside the London" in result.skipped[0][1]
+    assert result.setups == [] and not result.ran
+    assert "outside the scan window (02:00–12:00 New York time)" in result.skipped[0][1]
+    assert "Next window opens Wed 02:00 (in 13h 30m)" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_an_order_is_cancelled_when_the_window_closes():
+    candles, quote = _fetchers(_m5(), _h1())
+    late = scan_smc(candles, quote, ["EURUSD"], window=ScanWindow.parse("02:00-05:00"), now=NOW)
+    assert late.setups[0].expires_at == _ny(2026, 10, 6, 5)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +342,7 @@ def test_smc_orders_must_stay_in_the_zone_and_behind_the_sweep():
 
 
 @pytest.mark.unit
-def test_fx_scan_defaults_to_smc_and_explains_an_off_session_run(monkeypatch):
+def test_fx_scan_defaults_to_smc_and_explains_an_off_window_run(monkeypatch):
     from typer.testing import CliRunner
 
     import tradingagents.dataflows.vendors.oanda as oanda
@@ -308,7 +358,8 @@ def test_fx_scan_defaults_to_smc_and_explains_an_off_session_run(monkeypatch):
 
     out = CliRunner().invoke(app, ["fx-scan", "--symbols", "EURUSD", "--no-save"],
                              env={"OANDA_API_TOKEN": "x", "COLUMNS": "200"}).output
-    assert "outside the London" in out and "--any-session" in out
+    assert "outside the scan window" in out and "--any-session" in out
+    assert "Saved:" not in out and "win probabilities" not in out
 
     monkeypatch.setattr(smc_scanner, "scan_smc", lambda *a, **k: real(*a, now=NOW, **k))
     out = CliRunner().invoke(app, ["fx-scan", "--symbols", "EURUSD", "--no-save"],

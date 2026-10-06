@@ -416,4 +416,4 @@ def test_an_smc_order_cannot_outlive_its_session():
     accepted, _ = verify([{"symbol": "EURUSD", "entry": 1.1700, "stop": 1.1683, "target": 1.1745,
                            "valid_hours": 6}], [s], now=NOW)
     assert accepted[0].expires_at == NOW + timedelta(hours=1)
-    assert "session end" in accepted[0].notes[0]
+    assert "scanner's limit" in accepted[0].notes[0]

@@ -164,14 +164,17 @@ def fx_scan(
     top: int = typer.Option(10, "--top", help="How many setups the scanner keeps"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     strategy: str = typer.Option(
-        "smc", "--strategy", help="smc: H1 bias, M5 sweep → CHoCH → order block / FVG (London and NY sessions). "
+        "smc", "--strategy", help="smc: H1 bias, M5 sweep → CHoCH → order block / FVG, inside the scan window. "
                                   "trend: H4 trend, H1 pullback to a swing level or the 50 EMA"
     ),
+    window: str = typer.Option(
+        "02:00-12:00", "--window", help="smc: hours to build setups in, New York (= Toronto) time; may cross midnight"
+    ),
     any_session: bool = typer.Option(
-        False, "--any-session", help="smc: scan outside the London and New York sessions too"
+        False, "--any-session", help="smc: scan outside the window too"
     ),
     valid_hours: float = typer.Option(
-        None, "--valid-hours", help="Hours before an unfilled limit order is cancelled (smc: 4, capped at the session end; trend: 8)"
+        None, "--valid-hours", help="Hours before an unfilled limit order is cancelled (smc: 4, capped at the window's close; trend: 8)"
     ),
     max_per_currency: int = typer.Option(
         2, "--max-per-currency", help="Most setups long, or short, the same currency (e.g. 3 on a strong-dollar day)"
@@ -192,6 +195,12 @@ def fx_scan(
         raise typer.Exit(code=1)
     if valid_hours is None:
         valid_hours = 4.0 if strategy == "smc" else 8.0
+    from tradingagents.fx.smc_scanner import ScanWindow
+    try:
+        scan_window = ScanWindow.parse(window)
+    except ValueError as exc:
+        console.print(f"[red]--window: {exc}[/red]")
+        raise typer.Exit(code=1) from None
     from tradingagents.dataflows.errors import VendorNotConfiguredError
     from tradingagents.dataflows.vendors import oanda
     from tradingagents.fx import DEFAULT_UNIVERSE, scan
@@ -218,17 +227,27 @@ def fx_scan(
         if strategy == "smc":
             result = scan_smc(oanda.get_candles, oanda.get_quote, names,
                               min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
-                              max_per_currency=scan_cap, any_session=any_session)
+                              max_per_currency=scan_cap, window=scan_window,
+                              any_session=any_session)
         else:
             result = scan(oanda.get_candles, oanda.get_quote, names,
                           min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
                           max_per_currency=scan_cap, stop_atr=stop_atr)
 
+    if not result.ran:
+        # Outside the window nothing was scanned: say when it opens, and do
+        # not save an empty report or run the agents.
+        console.print(f"[yellow]{result.skipped[0][1]}[/yellow]")
+        return
+
     _print_scan(result, quiet=agents)
     review = None
     if agents:
         review = _run_fx_agents(result, final=final, max_per_currency=max_per_currency, min_rr=min_rr)
-    console.print(f"\n[dim]{AGENT_DISCLAIMER if agents else DISCLAIMER}[/dim]")
+    if review is not None and review.orders:
+        console.print(f"\n[dim]{AGENT_DISCLAIMER}[/dim]")
+    elif review is None and result.setups:
+        console.print(f"\n[dim]{DISCLAIMER}[/dim]")
 
     if save:
         md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], review)

@@ -35,7 +35,8 @@ Progress = Callable[[str], None]
 
 GROUND_RULES = f"""You work on an intraday forex and metals desk. {NO_EXTERNAL_TOOLS}
 Desk rules: every order is a limit order. An unfilled order is cancelled at its listed cancel \
-time (the end of its London or New York session) or earlier for a release. A filled trade is \
+time (no later than the end of the morning scan window, 12:00 New York by default) or \
+earlier for a release. A filled trade is \
 managed only by its stop and target and is closed at the New York 17:00 close (21:00 UTC in \
 summer, 22:00 UTC in winter) at the latest; nothing is held overnight.
 Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
