@@ -16,6 +16,7 @@ so it runs the same way in tests with stand-ins as on live prices.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -110,6 +111,24 @@ def setup_key(s: Setup) -> str:
     return f"{s.symbol}|{s.direction}|{s.entry}|{s.stop}"
 
 
+def _load_progress(journal: Journal, day) -> tuple[set[str], int]:
+    """What was already reviewed on ``day``, kept in the journal so a restart doesn't review it again."""
+    try:
+        seen = set(json.loads(journal.get_meta(f"seen:{day}", "[]")))
+        runs = int(journal.get_meta(f"runs:{day}", "0"))
+    except Exception:
+        return set(), 0
+    return seen, runs
+
+
+def _save_progress(journal: Journal, state: WatchState) -> None:
+    try:
+        journal.set_meta(f"seen:{state.day}", json.dumps(sorted(state.seen)))
+        journal.set_meta(f"runs:{state.day}", str(state.agent_runs))
+    except Exception:
+        pass                                    # memory still holds it for this run
+
+
 def cycle(
     now: datetime,
     *,
@@ -133,7 +152,8 @@ def cycle(
     """
     day = smc.trading_day(pd.Timestamp(now))
     if state.day != day:
-        state.day, state.seen, state.agent_runs, state.cap_warned = day, set(), 0, False
+        state.day, state.cap_warned = day, False
+        state.seen, state.agent_runs = _load_progress(journal, day)
 
     inside = window.current_end(now) is not None
     report = Cycle(at=now, in_window=inside)
@@ -193,6 +213,7 @@ def _scan_and_review(now, report: Cycle, *, journal, scan_fn, review_fn, notify,
                    "new setups are logged but not reviewed until tomorrow.")
             state.cap_warned = True
         state.seen |= keys
+        _save_progress(journal, state)
         report.notes.append("agent-review limit reached")
         return
 
@@ -203,6 +224,7 @@ def _scan_and_review(now, report: Cycle, *, journal, scan_fn, review_fn, notify,
         return
     state.agent_runs += 1
     state.seen |= keys
+    _save_progress(journal, state)
     report.reviewed = True
     if review is None:
         return
