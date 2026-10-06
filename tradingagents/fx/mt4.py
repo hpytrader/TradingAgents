@@ -99,7 +99,7 @@ class Mt4Config:
         path = path or config_path()
         if not path.exists():
             return None
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return cls(files_dir=data.get("files_dir", ""), lots=float(data.get("lots", 0.01)),
                    symbols=dict(data.get("symbols", {})))
 
@@ -107,18 +107,23 @@ class Mt4Config:
         path = path or config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"files_dir": self.files_dir, "lots": self.lots,
-                                    "symbols": self.symbols}, indent=2) + "\n")
+                                    "symbols": self.symbols}, indent=2) + "\n", encoding="utf-8")
         return path
 
 
 def find_files_folders(roots: list[Path] | None = None, max_depth: int = 14) -> list[Path]:
     """Every ``MQL4/Files`` folder under ``roots``, most recently used first.
 
-    On a Mac, MT4 runs inside Wine, so the folder sits deep in
-    ``~/Library/Application Support/<app>/drive_c/...``.
+    On Windows it is ``%APPDATA%\\MetaQuotes\\Terminal\\<id>\\MQL4\\Files`` (or under
+    Program Files for a portable install). On a Mac, MT4 runs inside Wine, so
+    it sits deep in ``~/Library/Application Support/<app>/drive_c/...``.
     """
     home = Path(os.path.expanduser("~"))
-    roots = roots or [home / "Library" / "Application Support", home / ".wine", home / "Library" / "Containers"]
+    if roots is None:
+        roots = [home / "Library" / "Application Support", home / ".wine", home / "Library" / "Containers"]
+        for var in ("APPDATA", "ProgramFiles", "ProgramFiles(x86)"):
+            if os.environ.get(var):
+                roots.append(Path(os.environ[var]))
     skip = {"Caches", "Google", "Code", "Slack", "CrashReporter", "MobileSync", "node_modules", "Logs"}
     found: list[Path] = []
     for root in roots:
@@ -148,7 +153,7 @@ def install_ea(files_dir: Path) -> Path:
     experts = files_dir.parent / "Experts"
     experts.mkdir(exist_ok=True)
     target = experts / EA_FILE.name
-    target.write_text(EA_FILE.read_text())
+    target.write_bytes(EA_FILE.read_bytes())
     return target
 
 
