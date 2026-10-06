@@ -259,6 +259,12 @@ def map_symbol(symbol: str, broker_symbols: list[str], overrides: dict[str, str]
     return None
 
 
+def symbol_choices(symbol: str, broker_symbols: list[str]) -> list[str]:
+    """Every broker symbol that could be ``symbol`` (e.g. ``USDJPY`` and ``USDJPY.r``)."""
+    names = (symbol, *ALIASES.get(symbol, ()))
+    return [b for b in broker_symbols if any(re.sub(r"[^A-Z]", "", b.upper()).startswith(n) for n in names)]
+
+
 # ---------------------------------------------------------------------------
 # The bridge
 # ---------------------------------------------------------------------------
@@ -390,6 +396,43 @@ class Bridge:
 
     def ping(self, now: datetime) -> str:
         return self.send("ping", now)
+
+    def wait(self, cid: str, seconds: float = 10.0, sleep=None) -> dict[str, str] | None:
+        """The EA's answer to instruction ``cid``, waiting up to ``seconds``."""
+        import time
+        sleep = sleep or time.sleep
+        for _ in range(int(seconds * 2)):
+            answer = self.answers().get(cid)
+            if answer:
+                return answer
+            sleep(0.5)
+        return None
+
+    def test_order(self, broker_symbol: str, now: datetime, sleep=None) -> list[str]:
+        """Place a buy limit 1% under the price at ``lots``, then cancel it: proves the whole route."""
+        state = self.state()
+        quote = state.quotes.get(broker_symbol) if state else None
+        if quote is None:
+            return [f"No price for {broker_symbol}: add it to MT4's Market Watch first (Ctrl+M → right-click → Symbols)."]
+        price = quote[0] * 0.99
+        lines = [f"Placing a test BUY LIMIT {broker_symbol} {self.lots:g} lot at {price:.5g} "
+                 f"(1% under the price {quote[0]:g}), then cancelling it…"]
+        cid = self.send("place", now, ticket="TEST", symbol=broker_symbol, side="buy", lots=f"{self.lots:.2f}",
+                        price=_price(price), sl=_price(price * 0.995), tp=_price(price * 1.01),
+                        comment=f"TA-TEST {now:%H%M%S}", expires=int((now + timedelta(minutes=30)).timestamp()),
+                        close_by=int((now + timedelta(minutes=30)).timestamp()))
+        placed = self.wait(cid, sleep=sleep)
+        if placed is None:
+            return [*lines, "No answer from MT4 within 10 s: is the EA on a chart with a smiley face?"]
+        if placed.get("ok") != "1":
+            return [*lines, f"REFUSED by MT4: {placed.get('message', '')} (error {placed.get('error', '?')})"]
+        mt4_ticket = placed.get("mt4", "")
+        lines.append(f"Placed: MT4 order #{mt4_ticket}")
+        done = self.wait(self.send("cancel", datetime.now(UTC), ticket="TEST", mt4=mt4_ticket), sleep=sleep)
+        if done is None or done.get("ok") != "1":
+            why = done.get("message", "") if done else "no answer"
+            return [*lines, f"Could NOT cancel #{mt4_ticket} ({why}): delete it by hand in MT4's Trade tab."]
+        return [*lines, f"Cancelled #{mt4_ticket}. {broker_symbol} works end to end."]
 
     # -- the sync -------------------------------------------------------------
 
