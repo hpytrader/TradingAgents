@@ -26,7 +26,7 @@ ORDER = ["desk", "macro", "price_action", "bull", "bear", "research_manager", "t
 @pytest.mark.unit
 def test_every_agent_has_a_distinct_name_and_a_bio():
     names = [p.name for p in DEFAULTS]
-    assert len(names) == len(set(names)) == 11
+    assert len(names) == len(set(names)) == 12
     assert all(p.bio and p.expertise and p.role for p in DEFAULTS)
 
 
@@ -50,8 +50,8 @@ def test_the_conversation_follows_the_decision_in_order():
 
     assert [m["agent"] for m in result.messages] == ORDER
     assert result.messages[0]["kind"] == "system" and "EURUSD BUY LIMIT" in result.messages[0]["text"]
-    assert result.messages[-1]["title"] == "Verification" and "✓ EURUSD" in result.messages[-1]["text"]
-    assert {m["name"] for m in result.messages} >= {"Atlas", "Vega", "Leo", "Ursa", "Sage", "Orion"}
+    assert result.messages[-1]["title"] == "Verification" and "✓ #1 EURUSD" in result.messages[-1]["text"]
+    assert {m["name"] for m in result.messages} >= {"Atlas", "Vega", "Leo", "Ursa", "Sage", "Donna"}
     assert result.to_dict()["messages"] == result.messages
 
 
@@ -130,14 +130,14 @@ def test_dashboard_embeds_the_chat_safely_and_ends_with_the_team(tmp_path):
     assert json.loads(payload)["reviews"][0]["id"] == rid
     assert f'data-review="{rid}"' in page and "desk chat ▸" in page
     assert page.index('id="chat"') < page.index("The desk") < page.index('class="foot"')
-    for name in ("Atlas", "Vega", "Leo", "Ursa", "Sage", "Nova", "Blaze", "Haven", "Pivot", "Orion"):
+    for name in ("Atlas", "Vega", "Leo", "Ursa", "Sage", "Nova", "Blaze", "Haven", "Pivot", "Ward", "Donna"):
         assert f"<h3>{name}</h3>" in page
 
 
 @pytest.mark.unit
 def test_an_empty_chat_explains_itself():
     page = dashboard.render([], stats([]), now=NOW)
-    assert "No conversations yet" in page and "<h3>Orion</h3>" in page
+    assert "No conversations yet" in page and "<h3>Donna</h3>" in page
 
 
 @pytest.mark.unit

@@ -26,7 +26,7 @@ from typing import Any
 from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 from tradingagents.fx.context import ReviewContext
 from tradingagents.fx.scanner import Setup
-from tradingagents.fx.schemas import FinalBook, ResearchVerdict, TraderPlan
+from tradingagents.fx.schemas import FinalBook, ManagementPlan, ResearchVerdict, TraderPlan
 from tradingagents.fx.team import team
 from tradingagents.fx.verify import VerifiedOrder, verify
 
@@ -44,7 +44,8 @@ Never invent prices, news or data releases. The economic calendar lists times, f
 previous values but never the actual result; an actual figure is known only if a headline \
 reports it. A rule-based scanner found the candidates; its levels and figures are facts. Your \
 job is judgement the scanner cannot make: news and event risk, whether a level or zone is \
-likely to hold, and how the trades interact."""
+likely to hold, and how the trades interact. Refer to every setup and trade by its ticket and \
+symbol, for example "#1043 AUDUSD"."""
 
 
 @dataclass
@@ -56,6 +57,9 @@ class Review:
     fallbacks: list[str] = field(default_factory=list)         # agents whose output was replaced
     problems: list[str] = field(default_factory=list)          # one-line reason per failed call
     messages: list[dict] = field(default_factory=list)         # the desk chat, in order
+    tickets: dict[str, str] = field(default_factory=dict)      # symbol -> ticket of each candidate
+    management: list[dict] = field(default_factory=list)       # the trade manager's actions
+    positions: list = field(default_factory=list)              # the live book Ward saw (not saved)
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +70,8 @@ class Review:
             "fallbacks": self.fallbacks,
             "problems": self.problems,
             "messages": self.messages,
+            "tickets": self.tickets,
+            "management": self.management,
         }
 
 
@@ -74,8 +80,9 @@ class Review:
 # ---------------------------------------------------------------------------
 
 def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
+    ticket = ctx.tickets.get(s.symbol, "")
     lines = [
-        f"### {s.symbol}: {s.order_type} @ {s.entry}",
+        f"### {ticket + ' ' if ticket else ''}{s.symbol}: {s.order_type} @ {s.entry}",
         f"- Stop {s.stop} ({s.risk_pips} pips), target {s.target} ({s.reward_pips} pips, "
         f"{s.target_kind}), {s.rr:.2f}R after a {s.spread_pips}-pip spread",
         f"- Price at scan {s.price}; 1h ATR {s.atr_pips} pips; scanner score {s.score:.0f}/100",
@@ -198,6 +205,25 @@ Say plainly when evidence is missing. Under 400 words.
 {macro_evidence(candidates, ctx)}""")
 
 
+def trade_manager(llm, book_text: str, macro: str, ctx, errors: list[str] | None = None) -> ManagementPlan | None:
+    return _structured(llm, ManagementPlan, f"""{GROUND_RULES}
+
+You are {team()['trade_manager'].name}, the TRADE MANAGER. Review every live trade below and give \
+one action for each. Defaults to holding: change a trade only for a concrete reason, such as a \
+release about to hit, structure turning against it, or a move far enough in its favour that the \
+stop can come to breakeven. Rules the desk enforces in code: a pending order can only be held or \
+cancelled; an open trade can be held, closed at the current price, have its target moved (it must \
+stay beyond price), or have its stop tightened (never widened, and never at or beyond price).
+
+## Live trades
+{book_text}
+
+## Macro brief from {team()['macro'].name}
+{macro}
+
+Time now: {ctx.now:%A %H:%M} UTC""", "Trade manager", errors)
+
+
 def price_action_analyst(llm, candidates, ctx) -> str:
     return _say(llm, f"""{GROUND_RULES}
 
@@ -288,7 +314,7 @@ rule reverts to the scanner's levels.
 
 
 def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx,
-                 heard: dict[str, str] | None = None) -> str:
+                 heard: dict[str, str] | None = None, book_text: str = "") -> str:
     view = {
         "aggressive": "Argue for taking the strongest setups at full size and for which "
                       "lower-conviction ones still deserve a place.",
@@ -316,11 +342,14 @@ Name specific symbols. Under 250 words.{replies}
 ## Trader's book
 {plan_text}
 
+## Trades already live (count them in the exposure)
+{book_text or "(none)"}
+
 Time now: {ctx.now:%A %H:%M} UTC""")
 
 
 def portfolio_manager(llm, plan_text, risk_views, macro, ctx, max_orders, max_per_currency,
-                      min_rr, errors: list[str] | None = None) -> FinalBook | None:
+                      min_rr, errors: list[str] | None = None, book_text: str = "") -> FinalBook | None:
     return _structured(llm, FinalBook, f"""{GROUND_RULES}
 
 You are {team()['portfolio_manager'].name}, the PORTFOLIO MANAGER, and make the final call. From the trader's book, choose at \
@@ -336,6 +365,9 @@ a rule reverts to the scanner's levels or is dropped.
 
 ## Trader's book
 {plan_text}
+
+## Trades already live (count them in the exposure; they are managed separately)
+{book_text or "(none)"}
 
 ## Risk team
 ### {team()['risk_aggressive'].name} (aggressive)
@@ -389,7 +421,7 @@ def _normal(symbol: str) -> str:
 def _opening(candidates: list[Setup], ctx: ReviewContext) -> str:
     lines = [f"{len(candidates)} setup(s) passed the scanner at {ctx.now:%H:%M} UTC:"]
     for c in candidates:
-        lines.append(f"• {c.symbol} {c.order_type} {c.entry} · SL {c.stop} · TP {c.target} · "
+        lines.append(f"• {ctx.tickets.get(c.symbol, '')} {c.symbol} {c.order_type} {c.entry} · SL {c.stop} · TP {c.target} · "
                      f"{c.rr:.2f}R · score {c.score:.0f}")
     if ctx.calendar_note:
         lines.append(f"Calendar: {ctx.calendar_note}")
@@ -403,16 +435,18 @@ def _opening(candidates: list[Setup], ctx: ReviewContext) -> str:
     return "\n".join(lines)
 
 
-def _closing(accepted: list[VerifiedOrder], dropped: list[tuple[str, str]]) -> str:
+def _closing(accepted: list[VerifiedOrder], dropped: list[tuple[str, str]],
+             tickets: dict[str, str] | None = None) -> str:
+    tickets = tickets or {}
     if not accepted:
         lines = ["No orders passed. The desk sits out this round."]
     else:
         lines = [f"{len(accepted)} order(s) verified against live levels and sent to the journal:"]
         for o in accepted:
-            lines.append(f"✓ {o.symbol} {o.order_type} {o.entry} · SL {o.stop} · TP {o.target} · "
+            lines.append(f"✓ {tickets.get(o.symbol, '')} {o.symbol} {o.order_type} {o.entry} · SL {o.stop} · TP {o.target} · "
                          f"{o.rr:.2f}R · cancel {o.expires_at:%H:%M} UTC · {o.conviction}")
             lines += [f"   note: {n}" for n in o.notes]
-    lines += [f"✕ {sym}: {why}" for sym, why in dropped]
+    lines += [f"✕ {tickets.get(sym, '')} {sym}: {why}" for sym, why in dropped]
     return "\n".join(lines)
 
 
@@ -427,8 +461,15 @@ def review(
     min_rr: float = 2.0,
     progress: Progress | None = None,
     now: datetime | None = None,
+    tickets: dict[str, str] | None = None,
+    positions: list | None = None,
 ) -> Review:
     """Run the agent team over ``candidates`` and return the verified book.
+
+    ``tickets`` gives each candidate's ticket (``{"AUDUSD": "#1043"}``); without
+    it they are numbered #1, #2, ... ``positions`` is the live book from
+    :func:`tradingagents.fx.manage.snapshot`: when given, the trade manager
+    reviews it and the risk team and portfolio manager see it.
 
     Every step is also recorded, in order, in ``Review.messages``: the desk's
     opening, each agent's argument (the bear answering the bull, each risk
@@ -451,7 +492,8 @@ def review(
 
     def finish(**kw) -> Review:
         return Review(transcript=transcript, messages=messages, fallbacks=fallbacks,
-                      problems=problems, **kw)
+                      problems=problems, tickets=ctx.tickets, management=management,
+                      positions=positions or [], **kw)
 
     def decide(make, label):
         """Strong model first, then the fast one: they often have separate quotas."""
@@ -466,12 +508,36 @@ def review(
     if not candidates:
         return Review(orders=[], dropped=[], summary="The scanner found no candidates to review.")
 
-    post("desk", "Scan", _opening(candidates, ctx), "system")
+    ctx.tickets = dict(tickets) if tickets else {c.symbol: f"#{i}" for i, c in enumerate(candidates, 1)}
+    management: list[dict] = []
+    book_text = ""
+    if positions:
+        from tradingagents.fx.manage import describe
+
+        book_text = describe(positions)
+    opening = _opening(candidates, ctx)
+    if positions:
+        live = sum(p.entry.status == "open" for p in positions)
+        opening += f"\nLive book: {live} open, {len(positions) - live} pending.\n{book_text}"
+    post("desk", "Scan", opening, "system")
 
     step(f"{people['macro'].name} reading the calendar and headlines")
     macro = _heard("Macro analyst", lambda: macro_analyst(quick_llm, candidates, ctx), problems)
     transcript["Macro analyst"] = macro
     post("macro", "Macro brief", macro)
+
+    if positions:
+        step(f"{people['trade_manager'].name} reviewing the live trades")
+        plan_ = decide(lambda llm: trade_manager(llm, book_text, macro, ctx, problems), "Trade manager")
+        if plan_ is None:
+            post("trade_manager", "Live trades", "(no usable answer: every trade is held as it is)", "decision")
+        else:
+            management = [a.model_dump() for a in plan_.actions]
+            lines = [plan_.summary, ""]
+            for a in plan_.actions:
+                detail = {"move_stop": f" → stop {a.new_stop}", "move_target": f" → target {a.new_target}"}.get(a.action, "")
+                lines.append(f"- {a.ticket}: {a.action.upper().replace('_', ' ')}{detail}. {a.reason}")
+            post("trade_manager", "Live trades", "\n".join(lines), "decision")
 
     step(f"{people['price_action'].name} reading the structure")
     structure = _heard("Price-action analyst",
@@ -510,7 +576,7 @@ def review(
     post("research_manager", "Verdict", verdict_text, "decision")
 
     if not kept:
-        post("desk", "Result", _closing([], dropped), "system")
+        post("desk", "Result", _closing([], dropped, ctx.tickets), "system")
         return finish(orders=[], dropped=dropped,
                       summary=verdict.summary if verdict else "No setups survived the debate.")
 
@@ -537,7 +603,8 @@ def review(
         heard = dict(risk_views)
         risk_views[stance] = _heard(
             f"{stance.title()} risk analyst",
-            lambda stance=stance, heard=heard: risk_analyst(quick_llm, stance, plan_text, macro, ctx, heard),
+            lambda stance=stance, heard=heard: risk_analyst(quick_llm, stance, plan_text, macro, ctx, heard,
+                                                            book_text),
             problems)
         transcript[f"{stance.title()} risk analyst"] = risk_views[stance]
         title = {"aggressive": "Risk: press", "conservative": f"Reply to {people['risk_aggressive'].name}",
@@ -546,7 +613,7 @@ def review(
 
     step(f"{people['portfolio_manager'].name} choosing the final orders")
     book = decide(lambda llm: portfolio_manager(llm, plan_text, risk_views, macro, ctx,
-                                                max_orders, max_per_currency, min_rr, problems),
+                                                max_orders, max_per_currency, min_rr, problems, book_text),
                   "Portfolio manager")
     if book is None:
         fallbacks.append("Portfolio manager: no usable answer; the trader's book ranked by "
@@ -570,7 +637,7 @@ def review(
     accepted, rejected = verify(proposals, candidates, now=now, min_rr=min_rr,
                                 max_orders=max_orders, max_per_currency=max_per_currency)
     dropped += [(sym, f"failed verification: {why}") for sym, why in rejected]
-    note = _closing(accepted, dropped)
+    note = _closing(accepted, dropped, ctx.tickets)
     if fallbacks or problems:
         note += "\n" + "\n".join(f"! {x}" for x in problems + fallbacks)
     post("desk", "Verification", note, "system")

@@ -69,15 +69,15 @@ def to_markdown(result: ScanResult, review: Review | None = None) -> str:
     lines += ["## Final orders", ""]
     if review.orders:
         lines += [
-            "| # | Symbol | Order | Entry | Stop | Target | RR | Cancel by (UTC) | Conviction |",
+            "| Ticket | Symbol | Order | Entry | Stop | Target | RR | Cancel by (UTC) | Conviction |",
             "|---|---|---|---|---|---|---|---|---|",
         ]
-        for i, o in enumerate(review.orders, 1):
-            lines.append(f"| {i} | {o.symbol} | {o.order_type} | {o.entry} | {o.stop} | {o.target} "
+        for o in review.orders:
+            lines.append(f"| {review.tickets.get(o.symbol, '')} | {o.symbol} | {o.order_type} | {o.entry} | {o.stop} | {o.target} "
                          f"| {o.rr:.2f} | {o.expires_at:%H:%M} | {o.conviction} |")
         lines.append("")
-        for i, o in enumerate(review.orders, 1):
-            lines += [f"### {i}. {o.symbol} {o.order_type} @ {o.entry}", "", o.rationale, "",
+        for o in review.orders:
+            lines += [f"### {review.tickets.get(o.symbol, '')} {o.symbol} {o.order_type} @ {o.entry}", "", o.rationale, "",
                       f"**Watch for:** {o.watch_for}", ""]
             lines += [f"- _Verification: {note}_" for note in o.notes]
             if o.notes:

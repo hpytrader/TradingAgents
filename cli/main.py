@@ -253,20 +253,19 @@ def fx_scan(
     if save:
         md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], review)
         console.print(f"Saved: {md}")
-    if review is not None:
+    if review is not None and review.messages:
         from datetime import UTC, datetime
 
-        book = _fx_journal()
-        stamp = datetime.now(UTC)
-        review_id = book.record_review(review, now=stamp)
-        if review_id:
-            console.print("Desk chat saved: see it with tradingagents fx-journal --open")
-    if review is not None and review.orders:
-        added = book.record(review.orders, now=stamp, report=str(md or ""), review_id=review_id)
-        repeat = len(review.orders) - len(added)
-        console.print(f"Journal: {len(added)} order(s) added"
-                      + (f", {repeat} already pending or open" if repeat else "")
-                      + ". See them with: tradingagents fx-journal --open")
+        from tradingagents.fx.watch import file_review
+
+        added, applied = file_review(review, _fx_journal(), now=datetime.now(UTC), report=str(md or ""))
+        for a in applied:
+            console.print(("[green]✓[/green] " if a.ok else "[yellow]✕[/yellow] ") + a.text)
+        if review.orders:
+            repeat = len(review.orders) - len(added)
+            console.print(f"Journal: {', '.join(e.label for e in added) or 'no new orders'}"
+                          + (f" ({repeat} already pending or open)" if repeat else ""))
+        console.print("Desk chat saved: see it with tradingagents fx-journal --open")
 
 
 def _fx_journal():
@@ -492,6 +491,18 @@ def fx_watch(
         console.print("\nWatcher stopped.")
 
 
+def _fx_desk_inputs(setups, now):
+    """Tickets for the candidates and a snapshot of the live book, for a review."""
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx.journal import ACTIVE
+    from tradingagents.fx.manage import snapshot
+
+    book = _fx_journal()
+    tickets = book.next_tickets(s.symbol for s in setups)
+    positions = snapshot(book.entries(ACTIVE), oanda.get_candles, oanda.get_quote, now)
+    return tickets, positions
+
+
 def _fx_reviewer(*, final: int, max_per_currency: int, min_rr: float):
     """A reviewer for the watcher: models built once, report saved, no exit on failure."""
     from tradingagents.fx import agents as fx_agents
@@ -507,8 +518,10 @@ def _fx_reviewer(*, final: int, max_per_currency: int, min_rr: float):
             models["quick"] = create_tier_client(DEFAULT_CONFIG, "quick").get_llm()
             models["deep"] = create_tier_client(DEFAULT_CONFIG, "deep").get_llm()
         context = gather(result.setups, now)
+        tickets, positions = _fx_desk_inputs(result.setups, now)
         outcome = fx_agents.review(result.setups, context, models["quick"], models["deep"],
-                                   max_orders=final, max_per_currency=max_per_currency, min_rr=min_rr, now=now)
+                                   max_orders=final, max_per_currency=max_per_currency, min_rr=min_rr, now=now,
+                                   tickets=tickets, positions=positions)
         for problem in outcome.problems:
             console.print(f"[yellow]Model problem: {problem}[/yellow]")
         md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], outcome)
@@ -581,11 +594,13 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
     now = datetime.now(UTC)
     with console.status("Reading the economic calendar and headlines...") as status:
         context = gather(result.setups, now)
+        tickets, positions = _fx_desk_inputs(result.setups, now)
         try:
             review = fx_agents.review(
                 result.setups, context, quick, deep,
                 max_orders=final, max_per_currency=max_per_currency, min_rr=min_rr,
                 progress=lambda msg: status.update(f"{msg}..."), now=now,
+                tickets=tickets, positions=positions,
             )
         except Exception as exc:
             console.print(f"[red]The agent review stopped: {exc}[/red]")
@@ -607,16 +622,16 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
 
     if review.orders:
         table = Table(title=f"Final orders ({len(review.orders)} of up to {final})")
-        for column in ("#", "Symbol", "Order", "Entry", "Stop", "Target", "RR", "Cancel by", "Conviction"):
-            table.add_column(column, justify="right" if column not in ("Symbol", "Order", "Conviction") else "left")
-        for i, o in enumerate(review.orders, 1):
+        for column in ("Ticket", "Symbol", "Order", "Entry", "Stop", "Target", "RR", "Cancel by", "Conviction"):
+            table.add_column(column, justify="right" if column not in ("Ticket", "Symbol", "Order", "Conviction") else "left")
+        for o in review.orders:
             colour = "green" if o.direction == "long" else "red"
-            table.add_row(str(i), o.symbol, f"[{colour}]{o.order_type}[/{colour}]", str(o.entry),
+            table.add_row(review.tickets.get(o.symbol, ""), o.symbol, f"[{colour}]{o.order_type}[/{colour}]", str(o.entry),
                           str(o.stop), str(o.target), f"{o.rr:.2f}",
                           f"{o.expires_at:%H:%M} UTC", o.conviction)
         console.print(table)
-        for i, o in enumerate(review.orders, 1):
-            console.print(f"[bold]{i}. {o.symbol}[/bold] {o.rationale}")
+        for o in review.orders:
+            console.print(f"[bold]{review.tickets.get(o.symbol, '')} {o.symbol}[/bold] {o.rationale}")
             console.print(f"   [dim]Watch for: {o.watch_for}[/dim]")
             for note in o.notes:
                 console.print(f"   [yellow]{note}[/yellow]")

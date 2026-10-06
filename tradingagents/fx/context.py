@@ -30,6 +30,7 @@ class ReviewContext:
     calendar_note: str = ""                                          # set when the calendar is unknown
     news: dict[str, str] = field(default_factory=dict)               # per symbol
     global_news: str = ""
+    tickets: dict[str, str] = field(default_factory=dict)            # symbol -> ticket for this review
 
 
 def _default_news(symbol: str, start: str, end: str) -> str:

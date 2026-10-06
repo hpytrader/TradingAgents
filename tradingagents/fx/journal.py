@@ -38,16 +38,22 @@ CandleFetcher = Callable[[str, str, int], pd.DataFrame]
 
 PENDING, OPEN = "pending", "open"
 WON, LOST, CLOSED, EXPIRED, MISSED = "won", "lost", "closed", "expired", "missed"
+CANCELLED = "cancelled"               # a pending order the trade manager withdrew
 ACTIVE = (PENDING, OPEN)
 FINISHED = (WON, LOST, CLOSED)        # filled and done: these carry an R result
-UNFILLED = (EXPIRED, MISSED)
+UNFILLED = (EXPIRED, MISSED, CANCELLED)
+FIRST_TICKET = 1001
 
 COLUMNS = (
     "id", "created_at", "symbol", "direction", "entry", "stop", "target", "planned_rr",
     "spread", "expires_at", "conviction", "rationale", "watch_for", "strategy", "scanner_score",
     "report", "status", "filled_at", "exit_at", "exit_price", "result_r", "note", "notified",
-    "review_id",
+    "review_id", "ticket", "initial_stop", "settled_to", "changes",
 )
+
+# Columns added after the first release, with how an older journal fills them.
+ADDED_COLUMNS = {"review_id": "TEXT", "ticket": "TEXT", "initial_stop": "REAL",
+                 "settled_to": "TEXT", "changes": "TEXT"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -74,9 +80,15 @@ CREATE TABLE IF NOT EXISTS orders (
     result_r REAL,
     note TEXT,
     notified TEXT,
-    review_id TEXT
+    review_id TEXT,
+    ticket TEXT,
+    initial_stop REAL,
+    settled_to TEXT,
+    changes TEXT
 )
 """
+
+META = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
 
 REVIEWS = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -117,6 +129,10 @@ class Entry:
     note: str = ""
     notified: str = ""
     review_id: str = ""
+    ticket: str = ""
+    initial_stop: float | None = None     # the stop at entry: R is always measured against it
+    settled_to: datetime | None = None    # prices replayed up to here; later changes apply after it
+    changes: list = field(default_factory=list)   # trade-manager actions, oldest first
 
     @property
     def long(self) -> bool:
@@ -128,7 +144,12 @@ class Entry:
 
     @property
     def risk(self) -> float:
-        return abs(self.entry - self.stop)
+        """One R: the distance to the stop the trade was planned with."""
+        return abs(self.entry - (self.initial_stop if self.initial_stop is not None else self.stop))
+
+    @property
+    def label(self) -> str:
+        return f"{self.ticket} {self.symbol}".strip()
 
 
 @dataclass
@@ -155,9 +176,28 @@ class Journal:
         with closing(self._connect()) as db, db:
             db.execute(SCHEMA)
             db.execute(REVIEWS)
+            db.execute(META)
             columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
-            if "review_id" not in columns:          # journals from before the desk chat
-                db.execute("ALTER TABLE orders ADD COLUMN review_id TEXT")
+            for name, kind in ADDED_COLUMNS.items():   # journals from earlier versions
+                if name not in columns:
+                    db.execute(f"ALTER TABLE orders ADD COLUMN {name} {kind}")
+            db.execute("UPDATE orders SET initial_stop = stop WHERE initial_stop IS NULL")
+            untagged = db.execute("SELECT id FROM orders WHERE ticket IS NULL OR ticket = '' "
+                                  "ORDER BY created_at").fetchall()
+            for (oid,) in untagged:
+                db.execute("UPDATE orders SET ticket = ? WHERE id = ?", (self._next(db), oid))
+
+    @staticmethod
+    def _next(db: sqlite3.Connection) -> str:
+        row = db.execute("SELECT value FROM meta WHERE key = 'ticket'").fetchone()
+        number = int(row[0]) + 1 if row else FIRST_TICKET
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('ticket', ?)", (str(number),))
+        return f"#{number}"
+
+    def next_tickets(self, symbols: Iterable[str]) -> dict[str, str]:
+        """A new ticket for each symbol, e.g. ``{"AUDUSD": "#1043"}``: never reused."""
+        with closing(self._connect()) as db, db:
+            return {symbol: self._next(db) for symbol in symbols}
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
@@ -179,8 +219,12 @@ class Journal:
     @staticmethod
     def _entry(row: sqlite3.Row) -> Entry:
         data = dict(row)
-        for key in ("created_at", "expires_at", "filled_at", "exit_at"):
+        import json
+
+        for key in ("created_at", "expires_at", "filled_at", "exit_at", "settled_to"):
             data[key] = _dt(data[key])
+        data["changes"] = json.loads(data["changes"]) if data.get("changes") else []
+        data["ticket"] = data.get("ticket") or ""
         data["spread"] = data["spread"] or 0.0
         data["notified"] = data["notified"] or ""
         data["note"] = data["note"] or ""
@@ -212,7 +256,8 @@ class Journal:
         return [{"id": r["id"], "at": r["at"], "summary": r["summary"] or "", "orders": r["orders"],
                  "messages": json.loads(r["messages"])} for r in rows]
 
-    def record(self, orders: Iterable, *, now: datetime, report: str = "", review_id: str = "") -> list[Entry]:
+    def record(self, orders: Iterable, *, now: datetime, report: str = "", review_id: str = "",
+               tickets: dict[str, str] | None = None) -> list[Entry]:
         """Add the review's final orders; returns the ones that are new.
 
         A suggestion repeating an order already pending or open for the same
@@ -232,7 +277,8 @@ class Journal:
                     spread=o.setup.spread_pips * spec.pip, expires_at=o.expires_at,
                     conviction=o.conviction, rationale=o.rationale, watch_for=o.watch_for,
                     strategy=o.setup.strategy, scanner_score=o.setup.score, report=report,
-                    review_id=review_id,
+                    review_id=review_id, ticket=(tickets or {}).get(o.symbol) or self._next(db),
+                    initial_stop=o.stop,
                 )
                 db.execute(
                     f"INSERT OR IGNORE INTO orders ({','.join(COLUMNS)}) VALUES ({','.join('?' * len(COLUMNS))})",
@@ -275,16 +321,52 @@ class Journal:
         return (e.id, _iso(e.created_at), e.symbol, e.direction, e.entry, e.stop, e.target,
                 e.planned_rr, e.spread, _iso(e.expires_at), e.conviction, e.rationale,
                 e.watch_for, e.strategy, e.scanner_score, e.report, e.status, _iso(e.filled_at),
-                _iso(e.exit_at), e.exit_price, e.result_r, e.note, e.notified, e.review_id)
+                _iso(e.exit_at), e.exit_price, e.result_r, e.note, e.notified, e.review_id,
+                e.ticket, e.initial_stop, _iso(e.settled_to), Journal._changes_json(e))
+
+    @staticmethod
+    def _changes_json(e: Entry) -> str:
+        import json
+
+        return json.dumps(e.changes) if e.changes else ""
 
     def save(self, e: Entry) -> None:
         with closing(self._connect()) as db, db:
             db.execute(
                 "UPDATE orders SET status=?, filled_at=?, exit_at=?, exit_price=?, result_r=?, "
-                "note=?, notified=? WHERE id=?",
+                "note=?, notified=?, stop=?, target=?, settled_to=?, changes=? WHERE id=?",
                 (e.status, _iso(e.filled_at), _iso(e.exit_at), e.exit_price, e.result_r,
-                 e.note, e.notified, e.id),
+                 e.note, e.notified, e.stop, e.target, _iso(e.settled_to), self._changes_json(e), e.id),
             )
+
+    # -- trade management ---------------------------------------------------
+
+    def _log(self, e: Entry, now: datetime, by: str, action: str, reason: str, **values) -> None:
+        e.changes.append({"at": _iso(now), "by": by, "action": action, "reason": reason, **values})
+
+    def modify(self, e: Entry, *, now: datetime, by: str, reason: str,
+               stop: float | None = None, target: float | None = None) -> None:
+        """Move an open trade's stop and/or target from ``now`` on."""
+        if stop is not None and stop != e.stop:
+            self._log(e, now, by, "move_stop", reason, old=e.stop, new=stop)
+            e.stop = stop
+        if target is not None and target != e.target:
+            self._log(e, now, by, "move_target", reason, old=e.target, new=target)
+            e.target = target
+        e.settled_to = max(e.settled_to or now, now)
+        self.save(e)
+
+    def close_now(self, e: Entry, *, price: float, now: datetime, by: str, reason: str) -> None:
+        """Close an open trade early at ``price`` (paper)."""
+        self._log(e, now, by, "close", reason, price=price)
+        _exit(e, CLOSED, now, price, f"closed early by {by}: {reason}")
+        self.save(e)
+
+    def cancel(self, e: Entry, *, now: datetime, by: str, reason: str) -> None:
+        """Withdraw a pending order."""
+        self._log(e, now, by, "cancel", reason)
+        e.status, e.exit_at, e.note = CANCELLED, now, f"cancelled by {by}: {reason}"
+        self.save(e)
 
     # -- settling -------------------------------------------------------------
 
@@ -343,8 +425,13 @@ def simulate(e: Entry, bars: pd.DataFrame, now: datetime) -> Entry:
     long = e.long
     if e.status == PENDING:
         bars = bars[bars.index >= pd.Timestamp(e.created_at)]
-    else:                                   # resuming an open trade: after its fill
-        bars = bars[bars.index > pd.Timestamp(e.filled_at)]
+    else:                                   # resuming an open trade: after what was replayed
+        # settled_to is the first moment not yet replayed: just after the last bar
+        # seen, or the time of a change, whichever is later.
+        if e.settled_to:
+            bars = bars[bars.index >= pd.Timestamp(max(e.settled_to, e.filled_at + timedelta(seconds=1)))]
+        else:
+            bars = bars[bars.index > pd.Timestamp(e.filled_at)]
     rows = list(bars.itertuples())
     k = 0
 
@@ -388,10 +475,16 @@ def simulate(e: Entry, bars: pd.DataFrame, now: datetime) -> Entry:
         hit = bar.high >= e.target if long else bar.low <= e.target
         if stopped:
             note = "stop and target in the same minute; counted as the stop" if hit else "stop hit"
-            return _exit(e, LOST, t, e.stop, note)
+            _exit(e, LOST, t, e.stop, note)
+            if any(c.get("action") == "move_stop" for c in e.changes):   # the manager had tightened it
+                profit = (e.result_r or 0) > 0
+                e.status = WON if profit else CLOSED
+                e.note = "moved stop hit in profit" if profit else "moved stop hit"
+            return e
         if hit:
             return _exit(e, WON, t, e.target, "target hit")
         last_close = bar.close
+        e.settled_to = t + timedelta(seconds=1)
         k += 1
     if now >= deadline and last_close is not None:
         return _exit(e, CLOSED, deadline, last_close, "still open at the New York 17:00 close")
@@ -418,6 +511,7 @@ class Stats:
     closed: int = 0
     expired: int = 0
     missed: int = 0
+    cancelled: int = 0
     total_r: float = 0.0
     avg_r: float | None = None            # expectancy per filled trade
     win_rate: float | None = None         # share of filled trades with R > 0
