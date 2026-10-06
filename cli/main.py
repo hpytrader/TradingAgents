@@ -831,7 +831,9 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
                           f"{o.expires_at:%H:%M} UTC", o.conviction)
         console.print(table)
         for o in review.orders:
-            console.print(f"[bold]{review.tickets.get(o.symbol, '')} {o.symbol}[/bold] {o.rationale}")
+            label = f"{review.tickets.get(o.symbol, '')} {o.symbol}".strip()
+            why = o.rationale.removeprefix(label).lstrip(" :-–—")   # the agents often start with it too
+            console.print(f"[bold]{label}[/bold] {why}")
             console.print(f"   [dim]Watch for: {o.watch_for}[/dim]")
             for note in o.notes:
                 console.print(f"   [yellow]{note}[/yellow]")

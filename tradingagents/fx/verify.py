@@ -213,8 +213,7 @@ def verify(
         expires = now + timedelta(hours=clamped)
         if setup.strategy == "smc" and expires > setup.expires_at:
             expires = setup.expires_at
-            notes.append(f"cancel time capped at the scanner's limit, {expires:%H:%M} UTC "
-                         "(four hours or the window's close)")
+            notes.append(f"cancel time capped at the scanner's limit, {expires:%H:%M} UTC")
         conviction = str(p.get("conviction", "low")).lower()
         if conviction not in ("low", "medium", "high"):
             conviction = "low"
