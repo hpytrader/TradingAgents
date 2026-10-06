@@ -15,8 +15,10 @@ For a long (shorts mirror it):
    wrong. **Target** at the nearest buy-side liquidity above price (previous day
    high, session high, equal highs, an intact 1-hour swing high) that pays at
    least ``min_rr`` after the spread.
-6. **Sessions.** Setups are only built during the London and New York sessions,
-   and an order is cancelled when its session ends.
+6. **Window.** Setups are only built inside the scan window, 02:00–12:00 New
+   York (and Toronto) time by default: the London session and the London–New
+   York overlap. An unfilled order is cancelled after four hours or when the
+   window closes, whichever is first. Weekends are always outside.
 
 The score ranks setups by the quality of the swept pool, displacement, OB/FVG
 confluence, entry depth, freshness and reward-to-risk. It is not a probability.
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from tradingagents.fx import smc
 from tradingagents.fx.instruments import DEFAULT_UNIVERSE, InstrumentSpec, spec_for
@@ -42,35 +44,104 @@ STALE_AFTER = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
-class Session:
-    name: str
-    tz: object
-    start: time
-    end: time
+class ScanWindow:
+    """The hours setups are built in, on New York time (also Toronto time).
 
-    def window(self, now: datetime) -> tuple[datetime, datetime] | None:
-        """This session's start and end today if ``now`` is inside it."""
-        local = now.astimezone(self.tz)
-        start = self.tz.localize(datetime.combine(local.date(), self.start))
-        end = self.tz.localize(datetime.combine(local.date(), self.end))
-        if start <= local < end:
-            return start.astimezone(UTC), end.astimezone(UTC)
+    The default, 02:00–12:00, runs from the London open to New York's midday,
+    covering the London session and the London–New York overlap. A window may
+    cross midnight (``19:00-12:00``). Weekends, when the forex market is shut
+    from Friday 17:00 to Sunday 17:00 New York, are outside every window.
+    """
+
+    start: time = time(2, 0)
+    end: time = time(12, 0)
+
+    @classmethod
+    def parse(cls, text: str) -> ScanWindow:
+        """``"02:00-12:00"`` → ScanWindow; ``ValueError`` for anything else."""
+        try:
+            a, b = (part.strip() for part in text.replace("–", "-").split("-"))
+            start, end = time.fromisoformat(a), time.fromisoformat(b)
+        except ValueError:
+            raise ValueError(f"window must look like 02:00-12:00, not {text!r}") from None
+        if start == end:
+            raise ValueError("the window's start and end must differ")
+        return cls(start, end)
+
+    def label(self) -> str:
+        return f"{self.start:%H:%M}–{self.end:%H:%M} New York time"
+
+    def _bounds(self, day: date) -> tuple[datetime, datetime]:
+        tz = smc.NEW_YORK
+        opens = tz.localize(datetime.combine(day, self.start))
+        closes_day = day if self.end > self.start else day + timedelta(days=1)
+        closes = tz.localize(datetime.combine(closes_day, self.end))
+        return opens, closes
+
+    def current_end(self, now: datetime) -> datetime | None:
+        """When the window ``now`` is in closes (UTC), or ``None`` if outside it."""
+        if not market_open(now):
+            return None
+        local = now.astimezone(smc.NEW_YORK)
+        for day in (local.date() - timedelta(days=1), local.date()):
+            opens, closes = self._bounds(day)
+            if opens <= local < closes:
+                return min(closes, _weekend_starts(local)).astimezone(UTC)
         return None
 
+    def next_open(self, now: datetime) -> datetime:
+        """The next time a window opens with the market open (UTC)."""
+        local = now.astimezone(smc.NEW_YORK)
+        for offset in range(0, 9):
+            opens, _ = self._bounds(local.date() + timedelta(days=offset))
+            if opens > local and market_open(opens):
+                return opens.astimezone(UTC)
+        raise RuntimeError("no window opens in the next week")  # pragma: no cover
 
-SESSIONS = {
-    "london": Session("London", smc.LONDON, time(7, 0), time(11, 0)),
-    "newyork": Session("New York", smc.NEW_YORK, time(8, 0), time(12, 0)),
-}
+
+def market_open(now: datetime) -> bool:
+    """Whether spot forex trades at ``now``: shut Friday 17:00 to Sunday 17:00 New York."""
+    local = now.astimezone(smc.NEW_YORK)
+    weekday, t = local.weekday(), local.time()
+    if weekday == 5:
+        return False
+    if weekday == 4 and t >= time(17, 0):
+        return False
+    return not (weekday == 6 and t < time(17, 0))
 
 
-def active_session(now: datetime, names: Iterable[str] = ("london", "newyork")) -> tuple[Session, datetime] | None:
-    """The session ``now`` falls in and when it ends, or ``None``."""
-    for name in names:
-        window = SESSIONS[name].window(now)
-        if window:
-            return SESSIONS[name], window[1]
-    return None
+def _weekend_starts(local: datetime) -> datetime:
+    friday = local.date() + timedelta(days=(4 - local.weekday()) % 7)
+    return smc.NEW_YORK.localize(datetime.combine(friday, time(17, 0)))
+
+
+def phase(now: datetime) -> str:
+    """Which session's hours ``now`` falls in, for the setup's reasons."""
+    t = now.astimezone(smc.NEW_YORK).time()
+    if time(2, 0) <= t < time(8, 0):
+        return "London"
+    if time(8, 0) <= t < time(12, 0):
+        return "New York"
+    if time(12, 0) <= t < time(17, 0):
+        return "New York afternoon"
+    return "Asian"
+
+
+def _until(later: datetime, now: datetime) -> str:
+    minutes = int((later - now).total_seconds() // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def outside_window_reason(window: ScanWindow, now: datetime) -> str:
+    local = now.astimezone(smc.NEW_YORK)
+    opens = window.next_open(now)
+    when = f"{opens.astimezone(smc.NEW_YORK):%a %H:%M} (in {_until(opens, now)})"
+    if not market_open(now):
+        return (f"the forex market is closed for the weekend (Friday 17:00 to Sunday 17:00 New York). "
+                f"The scan window next opens {when}.")
+    return (f"outside the scan window ({window.label()}); it is {local:%H:%M} in New York. "
+            f"Next window opens {when}. Use --any-session to scan anyway.")
 
 
 def scan_smc(
@@ -82,20 +153,23 @@ def scan_smc(
     top: int = 10,
     max_per_currency: int = 2,
     valid_hours: float = 4.0,
+    window: ScanWindow | None = None,
     any_session: bool = False,
     now: datetime | None = None,
 ) -> ScanResult:
-    """Scan ``symbols`` for SMC setups and return the best per instrument, ranked."""
+    """Scan ``symbols`` for SMC setups and return the best per instrument, ranked.
+
+    An unfilled order is cancelled after ``valid_hours`` or at the window's
+    close, whichever comes first.
+    """
     now = now or datetime.now(UTC)
-    current = active_session(now)
-    if current is None and not any_session:
-        local = now.astimezone(smc.NEW_YORK)
-        return ScanResult(scanned_at=now, setups=[], skipped=[(
-            "ALL", f"outside the London (07:00–11:00 London) and New York (08:00–12:00 New York) "
-                   f"sessions; it is {local:%H:%M} in New York. Use --any-session to scan anyway.")])
-    session_end = current[1] if current else now + timedelta(hours=valid_hours)
-    expires = min(session_end, now + timedelta(hours=valid_hours))
-    session_name = current[0].name if current else "off-session"
+    window = window or ScanWindow()
+    closes = window.current_end(now)
+    if closes is None and not any_session:
+        return ScanResult(scanned_at=now, setups=[], skipped=[("ALL", outside_window_reason(window, now))],
+                          ran=False)
+    expires = min(closes or now + timedelta(hours=valid_hours), now + timedelta(hours=valid_hours))
+    session_name = phase(now)
 
     best: list[Setup] = []
     skipped: list[tuple[str, str]] = []

@@ -94,6 +94,7 @@ class ScanResult:
     scanned_at: datetime
     setups: list[Setup]                                   # ranked, best first
     skipped: list[tuple[str, str]] = field(default_factory=list)   # symbol, why
+    ran: bool = True                                      # False when the scan was outside its window
 
     def to_dict(self) -> dict:
         return {

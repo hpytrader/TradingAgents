@@ -361,7 +361,7 @@ _, decision = ta.propagate("NVDA", "2026-09-01")
 `tradingagents fx-scan` looks for intraday limit-order setups across seven major pairs, five crosses, gold and silver, using spot prices from OANDA. The scan itself runs no AI and costs nothing; `--agents` adds the agent review below.
 
 ```bash
-tradingagents fx-scan                              # SMC strategy, London/NY sessions, RR ≥ 2
+tradingagents fx-scan                              # SMC strategy, 02:00–12:00 New York, RR ≥ 2
 tradingagents fx-scan --agents                     # plus the agent review: up to 6 final orders
 tradingagents fx-scan --symbols EURUSD,XAUUSD --min-rr 2.5
 tradingagents fx-scan --strategy trend             # the original trend-pullback rules
@@ -376,7 +376,7 @@ Every structure is detected in code from closed candles, so each level in a setu
 3. **Structure shift**: within three hours of the sweep, a 5-minute close breaks the last swing high (BOS or CHoCH).
 4. **Entry**: a buy limit at the middle of the unmitigated fair value gap the displacement left, preferring one inside the order block (the last down-close candle before the move), else the order block itself.
 5. **Stop** beyond the sweep's wick; **target** at the nearest buy-side liquidity above price (previous day high, session high, equal highs, an intact H1 swing high) paying at least the minimum RR after the spread.
-6. **Sessions**: setups are built only during London (07:00–11:00 London time) and New York (08:00–12:00 New York time), and an unfilled order is cancelled when its session ends (`--any-session` to scan at other times). Trading days roll at 17:00 New York.
+6. **Window**: setups are built only between 02:00 and 12:00 New York (and Toronto) time, from the London open through the London–New York overlap (`--window 03:00-11:00` to change it; a window may cross midnight, and `--any-session` scans at any time). An unfilled order is cancelled after four hours (`--valid-hours`) or when the window closes, whichever is first. Weekends, Friday 17:00 to Sunday 17:00 New York, are always outside; outside the window the command says when it next opens and saves nothing. Trading days roll at 17:00 New York.
 
 Each setup is scored out of 100 from the swept pool (previous day > session > equal highs/lows), displacement, FVG/order-block confluence, entry depth (discount or premium), the H1 break, reward-to-risk and freshness. The score ranks setups; it is not a win probability.
 
@@ -400,7 +400,7 @@ Both strategies hold at most two trades long or short the same currency (`--max-
 
 Every agent sees all candidates at once, so a review is ten model calls whatever the number of candidates. If the deep model fails (a spent free quota, say), the two managers fall back to the quick model before any rule-based fallback, and every failure is reported in one line.
 
-The final orders are then checked in code against the scanner's facts: the right side of price, the minimum RR after the spread and the per-currency cap; for SMC setups an entry inside the order block / FVG, a stop beyond the sweep and a cancel time no later than the session end; for trend setups an entry within 1.5 ATR of the scanner's level and a stop at least 0.5 ATR away. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.
+The final orders are then checked in code against the scanner's facts: the right side of price, the minimum RR after the spread and the per-currency cap; for SMC setups an entry inside the order block / FVG, a stop beyond the sweep and a cancel time no later than the scanner's; for trend setups an entry within 1.5 ATR of the scanner's level and a stop at least 0.5 ATR away. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.
 
 The review uses the provider and models set in `.env` (`TRADINGAGENTS_LLM_PROVIDER` and the quick and deep models). Headlines come from FXStreet's public news feed (Yahoo Finance when it cannot be read), matched to each pair by currency, central bank and nickname. The economic calendar is the Forex Factory weekly feed, cached for an hour; it carries forecasts but not actual results, and when it cannot be read the agents are told event risk is unknown rather than absent.
 
