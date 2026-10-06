@@ -34,7 +34,7 @@ def _wave(start_t, n, start, end, amp=0.0003):
     return rows
 
 
-def _m5(*, sweep=True, mitigate=False):
+def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729):
     t = datetime(2026, 10, 4, 21, 0, tzinfo=UTC)          # previous trading day starts
     rows = []
     rows += _wave(t, 144, 1.1720, 1.1790)                   # Oct 5 to 09:00: up to the day high
@@ -66,7 +66,7 @@ def _m5(*, sweep=True, mitigate=False):
     t = datetime(2026, 10, 6, 7, 55, tzinfo=UTC)
     for k in range(7):                                       # 07:55-08:25 holds above the gap
         p = 1.1743 + (0.0002 if k % 2 else -0.0001)
-        low_k = 1.1729 if (mitigate and k == 3) else p - 0.0003
+        low_k = mitigate_low if (mitigate and k == 3) else p - 0.0003
         rows.append(_bar(t + timedelta(minutes=5 * k), p, p + 0.0003, low_k, p))
     frame = pd.DataFrame(rows).set_index("time")
     frame.index = pd.DatetimeIndex(frame.index)
@@ -230,11 +230,39 @@ def test_a_pool_cannot_be_swept_before_it_exists():
 
 
 @pytest.mark.unit
-def test_a_mitigated_gap_is_not_an_entry():
-    candles, quote = _fetchers(_m5(mitigate=True), _h1())
+def test_a_filled_gap_falls_back_to_the_order_block():
+    # Price dipped to 1.1729: through the gap's middle (1.1730), above the
+    # order block's (1.1723). The gap would have filled; the OB is still open.
+    candles, quote = _fetchers(_m5(mitigate=True, mitigate_low=1.1729), _h1())
+    result = scan_smc(candles, quote, ["EURUSD"], now=NOW)
+    s = result.setups[0]
+    assert (s.zone_low, s.zone_high) == (1.1719, 1.1727)
+    assert s.entry == pytest.approx(1.1723)
+    assert "the order block 1.1719–1.1727" in " ".join(s.reasons)
+
+
+@pytest.mark.unit
+def test_when_every_zone_is_filled_there_is_no_entry():
+    candles, quote = _fetchers(_m5(mitigate=True, mitigate_low=1.1721), _h1())
     result = scan_smc(candles, quote, ["EURUSD"], now=NOW)
     assert result.setups == []
     assert "already been traded back into" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_a_stop_is_never_closer_than_the_noise(monkeypatch):
+    import tradingagents.fx.smc_scanner as smc_scanner
+
+    candles, quote = _fetchers(_m5(), _h1())
+    normal = scan_smc(candles, quote, ["EURUSD"], now=NOW).setups[0]
+    monkeypatch.setattr(smc_scanner, "MIN_RISK_H1_ATR", 1.0)    # demand a wider stop
+    wide = scan_smc(candles, quote, ["EURUSD"], now=NOW).setups[0]
+
+    assert wide.risk_pips > normal.risk_pips
+    assert wide.risk_pips == pytest.approx(wide.atr_pips, rel=0.05)
+    assert wide.stop < wide.invalidation                          # still beyond the sweep
+    assert "stop widened" in " ".join(wide.reasons)
+    assert "stop widened" not in " ".join(normal.reasons)
 
 
 @pytest.mark.unit

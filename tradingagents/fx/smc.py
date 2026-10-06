@@ -251,9 +251,15 @@ def fair_value_gaps(frame: pd.DataFrame, start: int, end: int, direction: str) -
     return out
 
 
-def mitigated(frame: pd.DataFrame, zone: Zone, price: float, direction: str) -> bool:
-    """Whether any bar after the zone formed has traded back to ``price`` inside it."""
-    after = frame.iloc[zone.formed_i + 1:]
+def mitigated(frame: pd.DataFrame, zone: Zone, price: float, direction: str,
+              after: int = -1) -> bool:
+    """Whether price came back to ``price`` inside the zone after leaving it.
+
+    Only bars after both the zone and ``after`` (the structure-shift bar)
+    count: the displacement candles that leave an order block often wick back
+    into it on the way out, and that is the move itself, not a return.
+    """
+    after = frame.iloc[max(zone.formed_i, after) + 1:]
     if after.empty:
         return False
     if direction == "up":
