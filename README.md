@@ -430,6 +430,18 @@ caffeinate -i tradingagents fx-watch --open    # run all morning
 
 `fx-watch` runs one cycle every ten minutes (`--interval`). Each cycle settles the journal and reports changes; inside the window it runs the free scanner and calls the agents only when a setup appears that it has not seen earlier in the trading day, at most twelve reviews a day (`--max-agent-runs`). New orders and results go to Telegram when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, and a summary is sent when the window closes. Outside the window it keeps settling open trades until the close, and the dashboard refreshes itself every minute while the watcher runs. The Mac must stay awake: `caffeinate -i` prevents idle sleep, but closing the lid still sleeps a laptop.
 
+### Placing the orders in MetaTrader 4 (e.g. CMC Markets)
+
+`tradingagents fx-watch --mt4` also places the desk's orders in an MT4 account and keeps them in step with the journal: new limit orders at a fixed lot size (0.01 by default), the trade manager's stop and target moves, his early closes, and cancels for orders the desk no longer waits on. Fills, closes and profit are sent to Telegram. The journal stays the desk's record, priced on OANDA; a trade filled at CMC runs on CMC's prices.
+
+MT4 has no API on a Mac, so the watcher and the Expert Advisor `TradingAgentsBridge.mq4` exchange small files in MT4's `MQL4/Files` folder. The EA has its own limits that hold even if the watcher stops: only its own orders (magic number), never above `MaxLots`, at most `MaxOpenOrders`, instructions older than two minutes ignored, unfilled orders deleted at their cancel time and trades closed at 17:00 New York.
+
+1. `tradingagents fx-mt4 --setup` finds MT4's folder, saves it to `~/.tradingagents/fx_mt4.json` and copies the EA into `MQL4/Experts`.
+2. In MT4: open MetaEditor (F4), open `Experts/TradingAgentsBridge.mq4`, press Compile (F7), and check it says 0 errors.
+3. Drag the EA from the Navigator onto any one chart, tick "Allow live trading", and turn on AutoTrading. Set the Account History tab to "Last 3 days".
+4. `tradingagents fx-mt4` checks the link and lists how each symbol maps (fix one with `--symbol XAUUSD=GOLD`).
+5. Run the watcher with `--mt4`. `tradingagents fx-mt4 --flatten` cancels and closes everything the desk has in MT4.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.

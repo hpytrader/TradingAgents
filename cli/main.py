@@ -426,6 +426,7 @@ def fx_watch(
     latest_cancel: str = typer.Option("14:00", "--latest-cancel", help="Cancel unfilled orders by this New York time at the latest"),
     symbols: str = typer.Option(None, "--symbols", help="Comma-separated pairs; omit for the default list"),
     open_page: bool = typer.Option(False, "--open", help="Open the dashboard in your browser at the start"),
+    mt4: bool = typer.Option(False, "--mt4", help="Also place and manage the orders in MT4 (set up with `tradingagents fx-mt4 --setup`)"),
 ):
     """Watch the market all morning: scan every few minutes, review new setups with the agents,
     journal the orders, settle them, and send alerts to Telegram."""
@@ -482,6 +483,7 @@ def fx_watch(
                   + (f"every {ward_every} min, until they finish" if ward_every else "only during agent reviews"))
     console.print("Telegram alerts: " + ("[green]on[/green]" if alerts else
                   "[yellow]off[/yellow] (run `tradingagents fx-telegram` to set them up)"))
+    bridge = _fx_bridge(book) if mt4 else None
     console.print(f"Dashboard: {page}\n[dim]Keep this window open and the Mac awake "
                   "(start it with `caffeinate -i tradingagents fx-watch`). Ctrl+C stops it.[/dim]\n")
     dashboard.write(page, book.entries(), stats(book.entries()), live=True, window=scan_window,
@@ -504,6 +506,8 @@ def fx_watch(
             if c.ward_checked:
                 parts.append(f"{ward_name} checked the live trades")
             parts += c.notes
+            if bridge is not None:
+                parts += _fx_bridge_sync(bridge, now, notify)
             console.print(" · ".join(parts))
             entries = book.entries()
             dashboard.write(page, entries, stats(entries), now=now, live=True, window=scan_window,
@@ -515,11 +519,141 @@ def fx_watch(
                 wait = timedelta(minutes=15)          # keep settling open trades until the close
             else:
                 wait = min(scan_window.next_open(now) - now, timedelta(hours=1))
-            clock.sleep(max(wait.total_seconds(), 30))
+            until = now + max(wait, timedelta(seconds=30))
+            while datetime.now(UTC) < until:          # MT4 fills and closes are reported within ~20 s
+                clock.sleep(min(20.0, max((until - datetime.now(UTC)).total_seconds(), 0.1)))
+                if bridge is not None:
+                    for note in _fx_bridge_sync(bridge, datetime.now(UTC), notify):
+                        console.print(f"[dim]MT4: {note}[/dim]")
     except KeyboardInterrupt:
         entries = book.entries()
         dashboard.write(page, entries, stats(entries), window=scan_window, reviews=book.reviews())
         console.print("\nWatcher stopped.")
+
+
+def _fx_bridge(book):
+    """The MT4 bridge from ~/.tradingagents/fx_mt4.json, or exit with how to set it up."""
+    from datetime import UTC, datetime
+
+    from tradingagents.fx.mt4 import Bridge, Mt4Config, config_path
+
+    cfg = Mt4Config.load()
+    if cfg is None or not cfg.files_dir:
+        console.print(f"[red]MT4 is not set up yet ({config_path()} missing). "
+                      "Run `tradingagents fx-mt4 --setup` first.[/red]")
+        raise typer.Exit(code=1)
+    bridge = Bridge(cfg.files_dir, book, lots=cfg.lots, symbols=cfg.symbols)
+    state = bridge.state()
+    ok, why = bridge.healthy(datetime.now(UTC), state)
+    if state is not None:
+        kind = "[yellow]DEMO[/yellow]" if state.demo else "[bold red]LIVE[/bold red]"
+        console.print(f"MT4: {kind} account {state.account} on {state.server} · "
+                      f"{state.balance:,.2f} {state.currency} · {cfg.lots:g} lot per order · EA cap {state.max_lots:g}")
+    console.print("MT4 bridge: " + ("[green]ready[/green]" if ok else f"[yellow]{why}[/yellow]"))
+    return bridge
+
+
+def _fx_bridge_sync(bridge, now, notify) -> list[str]:
+    try:
+        return bridge.sync(now, notify)
+    except Exception as exc:                      # a file problem must not stop the watcher
+        return [f"MT4 sync failed: {exc}"]
+
+
+@app.command("fx-mt4")
+def fx_mt4(
+    setup: bool = typer.Option(False, "--setup", help="Find MT4's files folder, save it, and install the EA"),
+    folder: str = typer.Option(None, "--folder", help="MT4's MQL4/Files folder, if --setup can't find it"),
+    lots: float = typer.Option(None, "--lots", help="Lot size for every order (default 0.01)"),
+    symbol: str = typer.Option(None, "--symbol", help="Map symbols to the broker's names, e.g. XAUUSD=GOLD,XAGUSD=SILVER"),
+    flatten: bool = typer.Option(False, "--flatten", help="Cancel every pending order and close every trade of the desk in MT4 now"),
+):
+    """Connect the desk to MetaTrader 4 (e.g. CMC Markets): setup, status, and an emergency flatten."""
+    import time as clock
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from tradingagents.fx import DEFAULT_UNIVERSE
+    from tradingagents.fx.mt4 import (
+        Bridge,
+        Mt4Config,
+        config_path,
+        find_files_folders,
+        install_ea,
+        map_symbol,
+    )
+
+    cfg = Mt4Config.load() or Mt4Config()
+    if setup or folder:
+        if folder:
+            chosen = Path(folder).expanduser()
+        else:
+            console.print("Looking for MetaTrader 4 on this Mac (this can take a minute)…")
+            found = find_files_folders()
+            if not found:
+                console.print("[red]No MT4 data folder found.[/red] In MT4 use File → Open Data Folder, open "
+                              "MQL4 → Files, and pass that path with --folder.")
+                raise typer.Exit(code=1)
+            for i, f in enumerate(found, 1):
+                console.print(f"  {i}. {f}")
+            pick = 1 if len(found) == 1 else typer.prompt("Which one is your CMC MT4", type=int, default=1)
+            chosen = found[pick - 1]
+        if not chosen.is_dir():
+            console.print(f"[red]Not a folder: {chosen}[/red]")
+            raise typer.Exit(code=1)
+        cfg.files_dir = str(chosen)
+        ea = install_ea(chosen)
+        console.print(f"[green]EA copied to[/green] {ea}")
+    if lots is not None:
+        if not 0 < lots <= 1:
+            console.print("[red]--lots must be between 0.01 and 1.[/red]")
+            raise typer.Exit(code=1)
+        cfg.lots = lots
+    for pair in (symbol or "").split(","):
+        ours, _, theirs = pair.partition("=")
+        if theirs:
+            cfg.symbols[ours.strip().upper()] = theirs.strip()
+    if setup or folder or lots is not None or symbol:
+        console.print(f"Saved {cfg.save()}")
+    if not cfg.files_dir:
+        console.print(f"[yellow]Not set up: run `tradingagents fx-mt4 --setup` ({config_path()}).[/yellow]")
+        raise typer.Exit(code=1)
+
+    bridge = Bridge(cfg.files_dir, _fx_journal(), lots=cfg.lots, symbols=cfg.symbols)
+    now = datetime.now(UTC)
+    if flatten:
+        if not typer.confirm("Cancel ALL of the desk's pending orders and close ALL its trades in MT4 now?"):
+            raise typer.Exit()
+        cid = bridge.flatten(now)
+    else:
+        cid = bridge.ping(now)
+    state = bridge.state()
+    ok, why = bridge.healthy(now, state)
+    console.print(f"Folder: {cfg.files_dir}\nLots per order: {cfg.lots:g}")
+    if state is None:
+        console.print("[yellow]The EA hasn't written anything yet: attach TradingAgentsBridge to a chart "
+                      "and turn AutoTrading on.[/yellow]")
+    else:
+        kind = "DEMO" if state.demo else "LIVE"
+        console.print(f"Account: {kind} {state.account} · {state.company} · {state.server}\n"
+                      f"Balance {state.balance:,.2f} {state.currency} · equity {state.equity:,.2f} · "
+                      f"EA lot cap {state.max_lots:g} · desk orders in MT4: {len(state.orders)}")
+        names = bridge.broker_symbols() or list(state.quotes)
+        mapped = {s: map_symbol(s, names, cfg.symbols) for s in DEFAULT_UNIVERSE}
+        console.print("Symbols: " + ", ".join(f"{s}→{m}" if m and m != s else (s if m else f"[red]{s}→?[/red]")
+                                             for s, m in mapped.items()))
+        if any(m is None for m in mapped.values()):
+            console.print("[yellow]Map a missing one with e.g. --symbol XAUUSD=GOLD[/yellow]")
+    console.print("Bridge: " + ("[green]ready[/green]" if ok else f"[yellow]{why}[/yellow]"))
+    for _ in range(10):                            # the EA answers within a second or two
+        clock.sleep(1)
+        answer = bridge.answers().get(cid)
+        if answer:
+            colour = "green" if answer.get("ok") == "1" else "red"
+            console.print(f"MT4 answered: [{colour}]{answer.get('message', '')}[/{colour}]")
+            break
+    else:
+        console.print("[yellow]No answer from MT4 within 10 s: is the EA on a chart with a smiley face?[/yellow]")
 
 
 def _fx_desk_inputs(setups, now):
