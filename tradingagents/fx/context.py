@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from tradingagents.dataflows.vendors import forex_calendar
 from tradingagents.dataflows.vendors.forex_calendar import Event
@@ -19,6 +19,7 @@ from tradingagents.fx.scanner import Setup
 # still drives the session.
 RECENT_EVENTS = timedelta(hours=12)
 NEWS_DAYS = 2
+HEADLINE_HOURS = 12
 
 
 @dataclass
@@ -32,13 +33,31 @@ class ReviewContext:
 
 
 def _default_news(symbol: str, start: str, end: str) -> str:
-    from tradingagents.dataflows.router import route_to_vendor
-    return route_to_vendor("get_news", symbol, start, end)
+    """FXStreet headlines for the pair; Yahoo only when FXStreet cannot be read."""
+    from tradingagents.dataflows.vendors import fxstreet
+
+    now = datetime.now(UTC)
+    try:
+        found = fxstreet.headlines_for(symbol, now, hours=HEADLINE_HOURS)
+    except Exception:
+        from tradingagents.dataflows.router import route_to_vendor
+        return "(FXStreet unavailable; Yahoo Finance instead)\n" + str(
+            route_to_vendor("get_news", symbol, start, end))
+    if not found:
+        return f"(FXStreet: no headlines mentioning {symbol[:3]} or {symbol[3:]} in the last {HEADLINE_HOURS}h)"
+    return "\n".join(f"- {h.describe()}" + (f" | {h.summary}" if h.summary else "") for h in found)
 
 
 def _default_global_news(as_of: str) -> str:
-    from tradingagents.dataflows.router import route_to_vendor
-    return route_to_vendor("get_global_news", as_of)
+    from tradingagents.dataflows.vendors import fxstreet
+
+    try:
+        found = fxstreet.market_headlines(datetime.now(UTC), hours=HEADLINE_HOURS)
+    except Exception:
+        from tradingagents.dataflows.router import route_to_vendor
+        return "(FXStreet unavailable; Yahoo Finance instead)\n" + str(
+            route_to_vendor("get_global_news", as_of))
+    return "\n".join(f"- {h.describe()}" for h in found) or "(no FXStreet headlines in the window)"
 
 
 def gather(

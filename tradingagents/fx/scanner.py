@@ -73,6 +73,10 @@ class Setup:
     target_kind: str               # "structure" or "measured"
     expires_at: datetime
     reasons: list[str] = field(default_factory=list)
+    strategy: str = "trend"            # "trend" or "smc"
+    zone_low: float | None = None      # smc: the order block / FVG the entry sits in
+    zone_high: float | None = None
+    invalidation: float | None = None  # smc: the sweep extreme the stop must stay beyond
 
     @property
     def order_type(self) -> str:
@@ -161,6 +165,12 @@ def scan(
             continue
         best.append(max(setups, key=lambda s: s.score))
 
+    return finish(best, skipped, now, top, max_per_currency)
+
+
+def finish(best: list[Setup], skipped: list[tuple[str, str]], now: datetime,
+           top: int, max_per_currency: int) -> ScanResult:
+    """Rank the best setup per instrument and say why each one left out was."""
     ranked = _rank(best, top, max_per_currency)
     taken = Counter(e for s in ranked for e in _exposure(s))
     for setup in best:

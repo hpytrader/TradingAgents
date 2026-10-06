@@ -3,11 +3,12 @@
 The roles follow the TradingAgents framework, adapted to a book of intraday
 limit orders rather than one stock:
 
-    Macro analyst ─► Bull researcher ┐
-                     Bear researcher ┴► Research manager ─► Trader
-        ─► Aggressive / Neutral / Conservative risk analysts ─► Portfolio manager
+    Macro analyst, Price-action analyst ─► Bull researcher ┐
+                                           Bear researcher ┴► Research manager
+        ─► Trader ─► Aggressive / Neutral / Conservative risk analysts
+        ─► Portfolio manager
 
-Each agent sees every candidate at once, so a scan costs nine model calls in
+Each agent sees every candidate at once, so a scan costs ten model calls in
 all, whatever the number of candidates. The fast ("quick") model argues; the
 strong ("deep") model makes the two judgements that decide the book. The
 portfolio manager's orders are then verified in code (``fx.verify``) before
@@ -32,11 +33,16 @@ logger = logging.getLogger(__name__)
 
 Progress = Callable[[str], None]
 
-GROUND_RULES = f"""You work on an intraday forex and metals desk. Orders are limit orders held \
-for a few hours, never overnight positions. {NO_EXTERNAL_TOOLS}
-Never invent prices, news or data releases. A rule-based scanner found the candidates; its \
-levels and figures are facts. Your job is judgement the scanner cannot make: news and \
-event risk, whether a level is likely to hold, and how the trades interact."""
+GROUND_RULES = f"""You work on an intraday forex and metals desk. {NO_EXTERNAL_TOOLS}
+Desk rules: every order is a limit order. An unfilled order is cancelled at its listed cancel \
+time (the end of its London or New York session) or earlier for a release. A filled trade is \
+managed only by its stop and target and is closed at the New York 17:00 close (21:00 UTC in \
+summer, 22:00 UTC in winter) at the latest; nothing is held overnight.
+Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
+previous values but never the actual result; an actual figure is known only if a headline \
+reports it. A rule-based scanner found the candidates; its levels and figures are facts. Your \
+job is judgement the scanner cannot make: news and event risk, whether a level or zone is \
+likely to hold, and how the trades interact."""
 
 
 @dataclass
@@ -69,6 +75,8 @@ def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
         f"- Stop {s.stop} ({s.risk_pips} pips), target {s.target} ({s.reward_pips} pips, "
         f"{s.target_kind}), {s.rr:.2f}R after a {s.spread_pips}-pip spread",
         f"- Price at scan {s.price}; 1h ATR {s.atr_pips} pips; scanner score {s.score:.0f}/100",
+        *([f"- SMC setup: entry zone {s.zone_low}–{s.zone_high}; idea invalid beyond the "
+           f"sweep extreme {s.invalidation}"] if s.strategy == "smc" else []),
         f"- Order expires {s.expires_at:%H:%M} UTC unless cancelled sooner",
     ]
     lines += [f"- {reason}" for reason in s.reasons]
@@ -186,13 +194,31 @@ Say plainly when evidence is missing. Under 400 words.
 {macro_evidence(candidates, ctx)}""")
 
 
-def researcher(llm, side: str, candidates, ctx, macro: str) -> str:
+def price_action_analyst(llm, candidates, ctx) -> str:
+    return _say(llm, f"""{GROUND_RULES}
+
+You are the PRICE-ACTION ANALYST, reading each setup as a smart-money trader would. For \
+every candidate, judge from the facts given: how significant the swept liquidity is \
+(previous day and session extremes outrank equal highs/lows), whether the displacement and \
+structure shift look decisive or marginal, the quality of the order block / fair value gap \
+and whether the entry is in discount (longs) or premium (shorts), whether the 1-hour bias \
+supports it, and whether the target liquidity is realistic for the time left in the session. \
+Give each candidate a grade (A, B or C) with two or three sentences. Under 350 words.
+
+{evidence(candidates, ctx)}""")
+
+
+def researcher(llm, side: str, candidates, ctx, macro: str, structure: str = "") -> str:
     stance = {
         "bull": ("BULL RESEARCHER", "make the strongest honest case FOR taking each setup",
-                 "trend quality, how often the level has held, confluence, room to the target"),
+                 "the liquidity taken and the strength of the shift, order block / fair value "
+                 "gap confluence, entry in discount or premium, the higher-timeframe bias, room "
+                 "to the opposing liquidity, and news that supports the direction"),
         "bear": ("BEAR RESEARCHER", "make the strongest honest case AGAINST each setup",
-                 "event risk before expiry, news against the direction, a stretched trend, "
-                 "a level that may not hold, a target that sits in the way of a reversal"),
+                 "a sweep that could be the start of a real breakdown rather than a stop hunt, "
+                 "weak displacement, a zone price may slice through, opposing liquidity too "
+                 "close or too far for the session, event risk before the order would fill and "
+                 "play out, and news against the direction"),
     }[side]
     return _say(llm, f"""{GROUND_RULES}
 
@@ -202,11 +228,14 @@ Use only the evidence given. Two to four sentences per candidate, then one line 
 ## Macro brief
 {macro}
 
+## Price-action read
+{structure or "(not available)"}
+
 {evidence(candidates, ctx)}""")
 
 
 def research_manager(llm, candidates, ctx, macro, bull, bear,
-                     errors: list[str] | None = None) -> ResearchVerdict | None:
+                     errors: list[str] | None = None, structure: str = "") -> ResearchVerdict | None:
     return _structured(llm, ResearchVerdict, f"""{GROUND_RULES}
 
 You are the RESEARCH MANAGER. Judge the bull and bear cases for each candidate and decide \
@@ -216,6 +245,9 @@ out. Keeping none is acceptable on a bad day. Return a verdict for every candida
 
 ## Macro brief
 {macro}
+
+## Price-action read
+{structure or "(not available)"}
 
 ## Bull case
 {bull}
@@ -232,9 +264,11 @@ def trader(llm, kept, ctx, verdict_text: str, errors: list[str] | None = None) -
 You are the TRADER. For each setup the research manager kept, write the order. Keep the \
 scanner's entry, stop and target unless the debate gives a concrete reason to change them, \
 and say what you changed. Rules the desk enforces in code: a buy limit stays below the price \
-at scan time and a sell limit above it; the entry moves at most 1.5 ATR from the scanner's \
-level; the stop stays at least 0.5 ATR from the entry; the reward-to-risk after the spread \
-stays at or above the minimum. An order breaking a rule reverts to the scanner's levels.
+at scan time and a sell limit above it; the reward-to-risk after the spread stays at or above \
+the minimum; for an SMC setup the entry stays inside its order block / fair value gap and the \
+stop stays beyond the sweep extreme; for any other setup the entry moves at most 1.5 ATR from \
+the scanner's level and the stop stays at least 0.5 ATR from the entry. An order breaking a \
+rule reverts to the scanner's levels.
 
 ## Research manager's verdict
 {verdict_text}
@@ -370,14 +404,22 @@ def review(
     macro = _heard("Macro analyst", lambda: macro_analyst(quick_llm, candidates, ctx), problems)
     transcript["Macro analyst"] = macro
 
+    step("Price-action analyst reading the structure")
+    structure = _heard("Price-action analyst",
+                       lambda: price_action_analyst(quick_llm, candidates, ctx), problems)
+    transcript["Price-action analyst"] = structure
+
     step("Bull and bear researchers debating the setups")
-    bull = _heard("Bull researcher", lambda: researcher(quick_llm, "bull", candidates, ctx, macro), problems)
-    bear = _heard("Bear researcher", lambda: researcher(quick_llm, "bear", candidates, ctx, macro), problems)
+    bull = _heard("Bull researcher",
+                  lambda: researcher(quick_llm, "bull", candidates, ctx, macro, structure), problems)
+    bear = _heard("Bear researcher",
+                  lambda: researcher(quick_llm, "bear", candidates, ctx, macro, structure), problems)
     transcript["Bull researcher"] = bull
     transcript["Bear researcher"] = bear
 
     step("Research manager judging the debate")
-    verdict = decide(lambda llm: research_manager(llm, candidates, ctx, macro, bull, bear, problems),
+    verdict = decide(lambda llm: research_manager(llm, candidates, ctx, macro, bull, bear, problems,
+                                                  structure),
                      "Research manager")
     if verdict is None:
         fallbacks.append("Research manager: no usable answer; every candidate passed to the trader")

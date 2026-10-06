@@ -194,13 +194,14 @@ def test_full_review_runs_every_role_once_and_verifies_the_book():
 
     result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
 
-    assert len(quick.prompts) == 7        # macro, bull, bear, trader, three risk analysts
+    assert len(quick.prompts) == 8        # macro, price action, bull, bear, trader, three risk
     assert len(deep.prompts) == 2         # research manager, portfolio manager
     assert [o.symbol for o in result.orders] == ["EURUSD", "USDJPY"]
     assert result.orders[0].entry == eur.entry            # reverted by verification
     assert "scanner levels used" in result.orders[0].notes[0]
     assert dict(result.dropped)["GBPUSD"].startswith("research manager")
-    assert set(result.transcript) >= {"Macro analyst", "Bull researcher", "Bear researcher",
+    assert set(result.transcript) >= {"Macro analyst", "Price-action analyst",
+                                      "Bull researcher", "Bear researcher",
                                       "Research manager", "Trader", "Portfolio manager",
                                       "Aggressive risk analyst", "Neutral risk analyst",
                                       "Conservative risk analyst"}
@@ -213,7 +214,7 @@ def test_dropping_everything_ends_the_review_early():
     quick, deep = _team(candidates, keep=[])
     result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
     assert result.orders == []
-    assert len(deep.prompts) == 1 and len(quick.prompts) == 3
+    assert len(deep.prompts) == 1 and len(quick.prompts) == 4
 
 
 @pytest.mark.unit
@@ -391,3 +392,28 @@ def test_a_failed_text_agent_does_not_stop_the_review():
 ])
 def test_provider_errors_become_one_line(message, reason):
     assert fx_agents.short_reason(RuntimeError(message)) == reason
+
+
+@pytest.mark.unit
+def test_the_desk_rules_name_the_close_and_the_missing_actuals():
+    text = fx_agents.GROUND_RULES
+    assert "17:00 close" in text and "never the actual result" in text
+
+
+@pytest.mark.unit
+def test_smc_candidates_show_their_zone_and_invalidation():
+    s = _setup()
+    s.strategy, s.zone_low, s.zone_high, s.invalidation = "smc", 1.1695, 1.1705, 1.1688
+    text = fx_agents.evidence([s], _ctx([s]))
+    assert "entry zone 1.1695–1.1705" in text and "sweep extreme 1.1688" in text
+
+
+@pytest.mark.unit
+def test_an_smc_order_cannot_outlive_its_session():
+    s = _setup(entry=1.1700, stop=1.1683, target=1.1745)
+    s.strategy, s.zone_low, s.zone_high, s.invalidation = "smc", 1.1695, 1.1705, 1.1688
+    s.expires_at = NOW + timedelta(hours=1)
+    accepted, _ = verify([{"symbol": "EURUSD", "entry": 1.1700, "stop": 1.1683, "target": 1.1745,
+                           "valid_hours": 6}], [s], now=NOW)
+    assert accepted[0].expires_at == NOW + timedelta(hours=1)
+    assert "session end" in accepted[0].notes[0]

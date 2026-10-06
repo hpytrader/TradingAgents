@@ -163,7 +163,16 @@ def fx_scan(
     ),
     top: int = typer.Option(10, "--top", help="How many setups the scanner keeps"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
-    valid_hours: float = typer.Option(8.0, "--valid-hours", help="Hours before an unfilled limit order should be cancelled"),
+    strategy: str = typer.Option(
+        "smc", "--strategy", help="smc: H1 bias, M5 sweep → CHoCH → order block / FVG (London and NY sessions). "
+                                  "trend: H4 trend, H1 pullback to a swing level or the 50 EMA"
+    ),
+    any_session: bool = typer.Option(
+        False, "--any-session", help="smc: scan outside the London and New York sessions too"
+    ),
+    valid_hours: float = typer.Option(
+        None, "--valid-hours", help="Hours before an unfilled limit order is cancelled (smc: 4, capped at the session end; trend: 8)"
+    ),
     max_per_currency: int = typer.Option(
         2, "--max-per-currency", help="Most setups long, or short, the same currency (e.g. 3 on a strong-dollar day)"
     ),
@@ -177,10 +186,17 @@ def fx_scan(
     save: bool = typer.Option(True, "--save/--no-save", help="Save the scan as Markdown and JSON"),
 ):
     """Scan forex and metals for intraday limit-order setups (OANDA prices; --agents adds the AI review)."""
+    strategy = strategy.strip().lower()
+    if strategy not in ("smc", "trend"):
+        console.print("[red]--strategy must be smc or trend.[/red]")
+        raise typer.Exit(code=1)
+    if valid_hours is None:
+        valid_hours = 4.0 if strategy == "smc" else 8.0
     from tradingagents.dataflows.errors import VendorNotConfiguredError
     from tradingagents.dataflows.vendors import oanda
     from tradingagents.fx import DEFAULT_UNIVERSE, scan
     from tradingagents.fx.report import AGENT_DISCLAIMER, DISCLAIMER, save as save_scan
+    from tradingagents.fx.smc_scanner import scan_smc
 
     names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
     if max_per_currency < 1 or stop_atr <= 0 or top < 1 or final < 1:
@@ -199,9 +215,14 @@ def fx_scan(
     scan_top = max(top, final + 4) if agents else top
     scan_cap = max_per_currency + 1 if agents else max_per_currency
     with console.status(f"Scanning {len(names)} instruments..."):
-        result = scan(oanda.get_candles, oanda.get_quote, names,
-                      min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
-                      max_per_currency=scan_cap, stop_atr=stop_atr)
+        if strategy == "smc":
+            result = scan_smc(oanda.get_candles, oanda.get_quote, names,
+                              min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
+                              max_per_currency=scan_cap, any_session=any_session)
+        else:
+            result = scan(oanda.get_candles, oanda.get_quote, names,
+                          min_rr=min_rr, top=scan_top, valid_hours=valid_hours,
+                          max_per_currency=scan_cap, stop_atr=stop_atr)
 
     _print_scan(result, quiet=agents)
     review = None
@@ -229,7 +250,7 @@ def _print_scan(result, quiet: bool = False):
         console.print(table)
     else:
         console.print("[yellow]No setups met the rules right now.[/yellow]")
-    if not quiet:
+    if not quiet or not result.setups:
         for symbol, reason in result.skipped:
             console.print(f"[dim]{symbol}: {reason}[/dim]")
 
@@ -291,7 +312,8 @@ def _run_fx_agents(result, *, final: int, max_per_currency: int, min_rr: float):
 
     if context.calendar_note:
         console.print(f"[yellow]{context.calendar_note}[/yellow]")
-    missing_news = [sym for sym, text in context.news.items() if text.startswith("(news unavailable")]
+    missing_news = [sym for sym, text in context.news.items()
+                    if text.startswith(("(news unavailable", "(FXStreet: no headlines"))]
     if missing_news:
         console.print(f"[dim]No headlines found for {', '.join(missing_news)}; the agents were told so.[/dim]")
     for problem in review.problems:
