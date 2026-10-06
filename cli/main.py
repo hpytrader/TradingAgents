@@ -567,8 +567,9 @@ def fx_mt4(
     lots: float = typer.Option(None, "--lots", help="Lot size for every order (default 0.01)"),
     symbol: str = typer.Option(None, "--symbol", help="Map symbols to the broker's names, e.g. XAUUSD=GOLD,XAGUSD=SILVER"),
     flatten: bool = typer.Option(False, "--flatten", help="Cancel every pending order and close every trade of the desk in MT4 now"),
+    test_order: str = typer.Option(None, "--test-order", help="Place a buy limit 1%% under the price on this symbol (e.g. EURUSD or USDJPY.r) and cancel it at once"),
 ):
-    """Connect the desk to MetaTrader 4 (e.g. CMC Markets): setup, status, and an emergency flatten."""
+    """Connect the desk to MetaTrader 4 (e.g. CMC Markets): setup, status, a test order, and an emergency flatten."""
     import time as clock
     from datetime import UTC, datetime
     from pathlib import Path
@@ -581,6 +582,7 @@ def fx_mt4(
         find_files_folders,
         install_ea,
         map_symbol,
+        symbol_choices,
     )
 
     cfg = Mt4Config.load() or Mt4Config()
@@ -588,7 +590,7 @@ def fx_mt4(
         if folder:
             chosen = Path(folder).expanduser()
         else:
-            console.print("Looking for MetaTrader 4 on this Mac (this can take a minute)…")
+            console.print("Looking for MetaTrader 4 on this computer (this can take a minute)…")
             found = find_files_folders()
             if not found:
                 console.print("[red]No MT4 data folder found.[/red] In MT4 use File → Open Data Folder, open "
@@ -644,7 +646,22 @@ def fx_mt4(
                                              for s, m in mapped.items()))
         if any(m is None for m in mapped.values()):
             console.print("[yellow]Map a missing one with e.g. --symbol XAUUSD=GOLD[/yellow]")
+        for s, m in mapped.items():
+            others = [c for c in symbol_choices(s, names) if c != m]
+            if m and others and s not in cfg.symbols:
+                console.print(f"[yellow]{s}: using {m}, but MT4 also has {', '.join(others)}. Check which one you "
+                              f"can trade (--test-order), then fix it with --symbol {s}=<name>.[/yellow]")
     console.print("Bridge: " + ("[green]ready[/green]" if ok else f"[yellow]{why}[/yellow]"))
+    if test_order and ok and state is not None:
+        bridge.answers()                           # clear the ping's answer
+        names = bridge.broker_symbols() or list(state.quotes)
+        target = test_order if test_order in names else map_symbol(test_order.upper(), names, cfg.symbols)
+        if target is None:
+            console.print(f"[red]MT4 has no symbol like {test_order}.[/red]")
+            raise typer.Exit(code=1)
+        for line in bridge.test_order(target, datetime.now(UTC)):
+            console.print(line)
+        return
     for _ in range(10):                            # the EA answers within a second or two
         clock.sleep(1)
         answer = bridge.answers().get(cid)

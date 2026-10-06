@@ -279,3 +279,35 @@ def test_the_ea_keeps_its_safety_rails():
     for rail in ("lots > MaxLots", "CountOurs() >= MaxOpenOrders", "TimeGMT() > validUntil",
                  "OrderMagicNumber() == MagicNumber", "bookExpires[k]", "bookCloseBy[k]"):
         assert rail in src
+
+
+@pytest.mark.unit
+def test_symbol_choices_show_every_variant():
+    names = ["USDJPY", "USDJPY.r", "EURUSD.r", "GOLD", "XAUUSD.r"]
+    assert mt4.symbol_choices("USDJPY", names) == ["USDJPY", "USDJPY.r"]
+    assert mt4.symbol_choices("XAUUSD", names) == ["GOLD", "XAUUSD.r"]
+
+
+@pytest.mark.unit
+def test_a_test_order_is_placed_under_the_price_and_cancelled(desk):
+    lines = desk.bridge.test_order("EURUSD", NOW, sleep=lambda _: desk.ea.run())
+    place, cancel = desk.ea.received
+    assert place["action"] == "place" and place["side"] == "buy" and place["lots"] == "0.01"
+    assert float(place["price"]) == pytest.approx(1.1719 * 0.99)
+    assert float(place["sl"]) < float(place["price"]) < float(place["tp"])
+    assert cancel["action"] == "cancel" and cancel["mt4"] == "5001"
+    assert "works end to end" in lines[-1] and not desk.ea.orders
+    assert not desk.bridge.rows()                                     # not part of the desk's book
+
+
+@pytest.mark.unit
+def test_a_test_order_reports_a_refusal(desk):
+    def refuse(_):
+        for path in desk.ea.dir.glob("ta_cmd_*.txt"):
+            cmd = mt4._kv(path.read_text())
+            path.unlink()
+            (desk.ea.dir / f"ta_res_{cmd['id']}.txt").write_text(
+                f"id={cmd['id']}\r\nok=0\r\nmt4=0\r\nerror=133\r\nmessage=trade is disabled\r\n")
+    lines = desk.bridge.test_order("EURUSD", NOW, sleep=refuse)
+    assert "REFUSED by MT4: trade is disabled (error 133)" in lines[-1]
+    assert "No price" in desk.bridge.test_order("USDJPY", NOW, sleep=refuse)[0]
