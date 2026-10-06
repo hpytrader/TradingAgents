@@ -21,7 +21,17 @@ from html import escape
 import requests
 
 from tradingagents.fx.instruments import spec_for
-from tradingagents.fx.journal import CLOSED, EXPIRED, LOST, MISSED, OPEN, WON, Entry, Stats
+from tradingagents.fx.journal import (
+    CANCELLED,
+    CLOSED,
+    EXPIRED,
+    LOST,
+    MISSED,
+    OPEN,
+    WON,
+    Entry,
+    Stats,
+)
 from tradingagents.fx.smc import NEW_YORK
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -96,7 +106,7 @@ def order_message(e: Entry) -> str:
     arrow = "▲" if e.long else "▼"
     pips = spec_for(e.symbol).pips(e.risk)
     lines = [
-        f"{arrow} <b>{e.order_type} {e.symbol}</b> @ {_price(e.symbol, e.entry)}",
+        f"{arrow} <b>{escape(e.ticket)} {e.order_type} {e.symbol}</b> @ {_price(e.symbol, e.entry)}",
         f"SL {_price(e.symbol, e.stop)} ({pips:.1f} pips) · TP {_price(e.symbol, e.target)} · "
         f"{e.planned_rr:.2f}R",
         f"Cancel {_local(e.expires_at)} New York · conviction {escape(e.conviction)}",
@@ -112,14 +122,16 @@ def order_message(e: Entry) -> str:
 def result_message(e: Entry) -> str:
     r = e.result_r or 0.0
     heads = {
-        OPEN: lambda: f"⏵ FILLED {e.symbol} {e.order_type} @ {_price(e.symbol, e.entry)}",
-        WON: lambda: f"✓ WON {e.symbol} {r:+.2f}R",
-        LOST: lambda: f"✕ LOST {e.symbol} {r:+.2f}R",
-        CLOSED: lambda: f"■ CLOSED {e.symbol} at the NY close {r:+.2f}R",
-        EXPIRED: lambda: f"○ EXPIRED {e.symbol}: not filled by {_local(e.expires_at)}",
-        MISSED: lambda: f"○ MISSED {e.symbol}: target reached before the fill",
+        OPEN: lambda: f"⏵ FILLED {e.label} {e.order_type} @ {_price(e.symbol, e.entry)}",
+        WON: lambda: f"✓ WON {e.label} {r:+.2f}R",
+        LOST: lambda: f"✕ LOST {e.label} {r:+.2f}R",
+        CLOSED: lambda: (f"■ CLOSED {e.label} {r:+.2f}R" if e.changes and e.changes[-1]["action"] == "close"
+                         else f"■ CLOSED {e.label} at the NY close {r:+.2f}R"),
+        EXPIRED: lambda: f"○ EXPIRED {e.label}: not filled by {_local(e.expires_at)}",
+        MISSED: lambda: f"○ MISSED {e.label}: target reached before the fill",
+        CANCELLED: lambda: f"○ CANCELLED {e.label}",
     }
-    head = heads[e.status]() if e.status in heads else f"{e.symbol}: {e.status}"
+    head = heads[e.status]() if e.status in heads else f"{e.label}: {e.status}"
     return f"<b>{escape(head)}</b>" + (f"\n{escape(e.note)}" if e.note and e.status in (WON, LOST, CLOSED) else "")
 
 

@@ -6,7 +6,7 @@ can introduce the team. Rename anyone without touching the code by writing
 ``~/.tradingagents/fx_team.json`` (or the file ``TRADINGAGENTS_FX_TEAM`` names),
 for example::
 
-    {"macro": {"name": "Jarvis"}, "portfolio_manager": {"name": "Friday"}}
+    {"macro": {"name": "Jarvis"}, "trade_manager": {"name": "Friday"}}
 
 Only the keys given are replaced; the rest keep their defaults.
 """
@@ -73,7 +73,12 @@ DEFAULTS: tuple[Profile, ...] = (
             ("Portfolio balance", "Combined exposure"),
             "Hears Blaze and Haven, then weighs the book as a whole: shared currencies, correlated pairs, "
             "orders that could fill into the same release.", "#9db6c1"),
-    Profile("portfolio_manager", "Orion", "Portfolio manager", "deep",
+    Profile("trade_manager", "Ward", "Trade manager", "deep",
+            ("Open-trade management", "Trailing stops", "Early exits"),
+            "Watches every pending and open trade whenever the desk meets. Decides whether to hold, "
+            "close early, tighten the stop, move the target or withdraw a pending order, from how the "
+            "trade is doing, the time left and the news. Never widens a stop.", "#fab219"),
+    Profile("portfolio_manager", "Donna", "Portfolio manager", "deep",
             ("Final allocation", "Cancel timing"),
             "Makes the final call: up to six limit orders, or none, each with a cancel time set ahead "
             "of any high-impact release.", "#5ce1f0"),

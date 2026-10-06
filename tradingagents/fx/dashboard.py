@@ -33,6 +33,7 @@ STATUS = {
     jr.CLOSED: ("■", "Closed at NY close", "neutral"),
     jr.EXPIRED: ("○", "Expired", "muted"),
     jr.MISSED: ("○", "Missed", "muted"),
+    jr.CANCELLED: ("○", "Cancelled", "muted"),
 }
 
 CSS = """
@@ -307,7 +308,7 @@ def _live(entries: list[Entry]) -> str:
     for e in sorted(live, key=lambda e: e.created_at, reverse=True):
         when = (f"filled {_ny(e.filled_at, '%H:%M')}" if e.status == jr.OPEN
                 else f"cancel {_ny(e.expires_at, '%H:%M')} NY")
-        rows.append(f"""<div class="ord"><div class="h"><b>{'▲' if e.long else '▼'} {escape(e.symbol)}</b>{_chip(e.status)}</div>
+        rows.append(f"""<div class="ord"><div class="h"><b>{'▲' if e.long else '▼'} <span class="mono" style="color:var(--accent)">{escape(e.ticket)}</span> {escape(e.symbol)}</b>{_chip(e.status)}</div>
 <div class="lv mono">{e.order_type} {_p(e.symbol, e.entry)} · SL {_p(e.symbol, e.stop)} · TP {_p(e.symbol, e.target)}</div>
 <div class="lv">{(e.planned_rr or 0):.2f}R planned · {escape(e.conviction)} conviction · {escape(when)}</div></div>""")
     return head + f'<div class="orders">{"".join(rows)}</div></div>'
@@ -339,20 +340,26 @@ def _table(entries: list[Entry], linked: set[str] | None = None) -> str:
     rows = []
     for e in sorted(entries, key=lambda e: e.created_at, reverse=True):
         why = ""
-        if e.rationale or e.watch_for or e.note:
+        if e.rationale or e.watch_for or e.note or e.changes:
+            changes = "".join(
+                f"<p><b>{escape(c.get('by', ''))}, {_ny(datetime.fromisoformat(c['at']), '%H:%M')}:</b> "
+                f"{escape(c['action'].replace('_', ' '))} "
+                f"{escape(str(c.get('old', '')))}{' → ' if 'new' in c else ''}{escape(str(c.get('new', c.get('price', ''))))}"
+                f" · {escape(c.get('reason', ''))}</p>" for c in e.changes)
             parts = [f"<p>{escape(e.rationale)}</p>" if e.rationale else "",
                      f"<p><b>Watch for:</b> {escape(e.watch_for)}</p>" if e.watch_for else "",
+                     changes,
                      f"<p><b>Outcome:</b> {escape(e.note)}</p>" if e.note else ""]
             why = f'<details><summary>reasoning ▸</summary>{"".join(parts)}</details>'
         if e.review_id in linked:
             why += (f'<a class="disc" href="#chat" data-review="{escape(e.review_id, quote=True)}">'
                     'desk chat ▸</a>')
-        rows.append(f"""<tr><td class="mono">{_ny(e.created_at)}</td><td><b>{escape(e.symbol)}</b><br>
+        rows.append(f"""<tr><td class="mono" style="color:var(--accent)">{escape(e.ticket)}</td><td class="mono">{_ny(e.created_at)}</td><td><b>{escape(e.symbol)}</b><br>
 <span style="color:var(--text-2);font-size:12px">{e.order_type}</span></td>
 <td class="n">{_p(e.symbol, e.entry)}</td><td class="n">{_p(e.symbol, e.stop)}</td><td class="n">{_p(e.symbol, e.target)}</td>
 <td class="n">{(e.planned_rr or 0):.2f}</td><td>{escape(e.conviction)}</td><td>{_chip(e.status)}</td>
 <td class="n">{_r(e.result_r)}</td><td>{why}</td></tr>""")
-    return head + f"""<div class="scroll"><table><thead><tr><th>Suggested (NY)</th><th>Order</th><th class="n">Entry</th>
+    return head + f"""<div class="scroll"><table><thead><tr><th>Ticket</th><th>Suggested (NY)</th><th>Order</th><th class="n">Entry</th>
 <th class="n">Stop</th><th class="n">Target</th><th class="n">Plan R</th><th>Conviction</th><th>Status</th>
 <th class="n">Result</th><th>Why</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></div>"""
 

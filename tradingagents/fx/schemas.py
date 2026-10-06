@@ -55,3 +55,19 @@ class FinalBook(BaseModel):
         description="The final limit orders, best first. Fewer than the maximum, or none, is allowed."
     )
     summary: str = Field(description="Three or four sentences: the day's theme and how the book is positioned.")
+
+
+class TradeAction(BaseModel):
+    ticket: str = Field(description="The trade's ticket exactly as listed, e.g. #1043.")
+    action: Literal["hold", "close", "move_stop", "move_target", "cancel"] = Field(
+        description="hold; close (open trades, at the current price); move_stop (open trades, tighten "
+                    "only); move_target (open trades, still beyond price); cancel (pending orders only)."
+    )
+    new_stop: float | None = Field(default=None, description="For move_stop: the new stop price.")
+    new_target: float | None = Field(default=None, description="For move_target: the new target price.")
+    reason: str = Field(description="One or two sentences: why.")
+
+
+class ManagementPlan(BaseModel):
+    actions: list[TradeAction] = Field(description="One action for every listed trade.")
+    summary: str = Field(description="One or two sentences on the open book.")

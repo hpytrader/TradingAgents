@@ -57,6 +57,39 @@ class Cycle:
     notes: list[str] = field(default_factory=list)
 
 
+def file_review(review, journal: Journal, *, now: datetime, report: str = "",
+                notify: Notify | None = None) -> tuple[list[Entry], list]:
+    """After a review: apply the trade manager's actions, then save the chat and the new orders.
+
+    Returns the new journal entries and the trade-manager results. Ward's
+    results, applied or refused, are added to the conversation by the Desk
+    before it is saved, so the chat shows what actually happened.
+    """
+    from tradingagents.fx.manage import apply
+    from tradingagents.fx.team import team
+
+    applied = []
+    actions = getattr(review, "management", None) or []
+    if actions:
+        applied = apply(actions, getattr(review, "positions", []) or [], journal, now=now,
+                        by=team()["trade_manager"].name)
+        if applied and hasattr(review, "messages"):
+            desk = team()["desk"]
+            review.messages.append({"agent": "desk", "name": desk.name, "role": desk.role,
+                                    "title": "Trade changes", "kind": "system",
+                                    "text": "\n".join(("✓ " if a.ok else "✕ ") + a.text for a in applied)})
+        if notify:
+            for a in applied:
+                if a.ok:
+                    notify(f"<b>⚙ {a.text.split(':', 1)[0]}</b>:{a.text.split(':', 1)[1]}")
+    review_id = journal.record_review(review, now=now)
+    added = []
+    if getattr(review, "orders", None):
+        added = journal.record(review.orders, now=now, report=report, review_id=review_id,
+                               tickets=getattr(review, "tickets", None))
+    return added, applied
+
+
 def setup_key(s: Setup) -> str:
     """One trade idea: the same symbol, direction and zone (or levels) seen again is not new."""
     if s.zone_low is not None:
@@ -124,10 +157,10 @@ def cycle(
     state.agent_runs += 1
     state.seen |= keys
     report.reviewed = True
-    review_id = journal.record_review(review, now=now) if review is not None else ""
-    if review is None or not getattr(review, "orders", None):
+    if review is None:
         return report
-    report.new_orders = journal.record(review.orders, now=now, report=report_path, review_id=review_id)
+    report.new_orders, applied = file_review(review, journal, now=now, report=report_path, notify=notify)
+    report.notes += [a.text for a in applied if not a.ok]
     for entry in report.new_orders:
         notify(order_message(entry))
     return report
