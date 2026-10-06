@@ -39,6 +39,7 @@ def _own_file_locations():
     os.environ["TRADINGAGENTS_RESULTS_DIR"] = os.path.join(home, "logs")
     os.environ["TRADINGAGENTS_CACHE_DIR"] = os.path.join(home, "cache")
     os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = os.path.join(home, "memory", "trading_memory.md")
+    os.environ["TRADINGAGENTS_FX_TEAM"] = os.path.join(home, "fx_team.json")   # never the user's renames
 
 
 _own_file_locations()

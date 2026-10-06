@@ -124,9 +124,10 @@ def cycle(
     state.agent_runs += 1
     state.seen |= keys
     report.reviewed = True
+    review_id = journal.record_review(review, now=now) if review is not None else ""
     if review is None or not getattr(review, "orders", None):
         return report
-    report.new_orders = journal.record(review.orders, now=now, report=report_path)
+    report.new_orders = journal.record(review.orders, now=now, report=report_path, review_id=review_id)
     for entry in report.new_orders:
         notify(order_message(entry))
     return report

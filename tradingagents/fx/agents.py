@@ -27,6 +27,7 @@ from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 from tradingagents.fx.context import ReviewContext
 from tradingagents.fx.scanner import Setup
 from tradingagents.fx.schemas import FinalBook, ResearchVerdict, TraderPlan
+from tradingagents.fx.team import team
 from tradingagents.fx.verify import VerifiedOrder, verify
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class Review:
     transcript: dict[str, str] = field(default_factory=dict)   # agent → what it said
     fallbacks: list[str] = field(default_factory=list)         # agents whose output was replaced
     problems: list[str] = field(default_factory=list)          # one-line reason per failed call
+    messages: list[dict] = field(default_factory=list)         # the desk chat, in order
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +65,7 @@ class Review:
             "transcript": self.transcript,
             "fallbacks": self.fallbacks,
             "problems": self.problems,
+            "messages": self.messages,
         }
 
 
@@ -184,7 +187,7 @@ def _structured(llm: Any, schema: type, prompt: str, agent: str,
 def macro_analyst(llm, candidates, ctx) -> str:
     return _say(llm, f"""{GROUND_RULES}
 
-You are the MACRO ANALYST. From the calendar and headlines below, brief the desk:
+You are {team()['macro'].name}, the MACRO ANALYST. From the calendar and headlines below, brief the desk:
 1. For each currency involved (and gold/silver if present): the current driver in one or two \
 sentences: central-bank stance, the latest data surprise, risk sentiment.
 2. Event risk: list every release before the candidates expire, its time, the currencies it \
@@ -198,7 +201,7 @@ Say plainly when evidence is missing. Under 400 words.
 def price_action_analyst(llm, candidates, ctx) -> str:
     return _say(llm, f"""{GROUND_RULES}
 
-You are the PRICE-ACTION ANALYST, reading each setup as a smart-money trader would. For \
+You are {team()['price_action'].name}, the PRICE-ACTION ANALYST, reading each setup as a smart-money trader would. For \
 every candidate, judge from the facts given: how significant the swept liquidity is \
 (previous day and session extremes outrank equal highs/lows), whether the displacement and \
 structure shift look decisive or marginal, the quality of the order block / fair value gap \
@@ -209,7 +212,7 @@ Give each candidate a grade (A, B or C) with two or three sentences. Under 350 w
 {evidence(candidates, ctx)}""")
 
 
-def researcher(llm, side: str, candidates, ctx, macro: str, structure: str = "") -> str:
+def researcher(llm, side: str, candidates, ctx, macro: str, structure: str = "", rebut: str = "") -> str:
     stance = {
         "bull": ("BULL RESEARCHER", "make the strongest honest case FOR taking each setup",
                  "the liquidity taken and the strength of the shift, order block / fair value "
@@ -221,15 +224,22 @@ def researcher(llm, side: str, candidates, ctx, macro: str, structure: str = "")
                  "close or too far for the session, event risk before the order would fill and "
                  "play out, and news against the direction"),
     }[side]
+    people = team()
+    me = people[side].name
+    reply = ""
+    if rebut:
+        reply = (f"\n\n{people['bull'].name}, the bull researcher, has made this case. Answer it "
+                 f"point by point: concede what is right, and say where it is wrong or missing "
+                 f"something.\n\n## {people['bull'].name}'s case\n{rebut}")
     return _say(llm, f"""{GROUND_RULES}
 
-You are the {stance[0]}. For every candidate, {stance[1]}. Focus on {stance[2]}. \
-Use only the evidence given. Two to four sentences per candidate, then one line ranking them.
+You are {me}, the {stance[0]}. For every candidate, {stance[1]}. Focus on {stance[2]}. \
+Use only the evidence given. Two to four sentences per candidate, then one line ranking them.{reply}
 
-## Macro brief
+## Macro brief from {people['macro'].name}
 {macro}
 
-## Price-action read
+## Price-action read from {people['price_action'].name}
 {structure or "(not available)"}
 
 {evidence(candidates, ctx)}""")
@@ -239,7 +249,7 @@ def research_manager(llm, candidates, ctx, macro, bull, bear,
                      errors: list[str] | None = None, structure: str = "") -> ResearchVerdict | None:
     return _structured(llm, ResearchVerdict, f"""{GROUND_RULES}
 
-You are the RESEARCH MANAGER. Judge the bull and bear cases for each candidate and decide \
+You are {team()['research_manager'].name}, the RESEARCH MANAGER. Judge the bull and bear cases for each candidate and decide \
 which go to the trader. Drop a setup when the bear case is stronger, above all when a \
 high-impact release for either currency is due before the order would likely fill and play \
 out. Keeping none is acceptable on a bad day. Return a verdict for every candidate.
@@ -250,10 +260,10 @@ out. Keeping none is acceptable on a bad day. Return a verdict for every candida
 ## Price-action read
 {structure or "(not available)"}
 
-## Bull case
+## Bull case ({team()['bull'].name})
 {bull}
 
-## Bear case
+## Bear case and rebuttal ({team()['bear'].name})
 {bear}
 
 {evidence(candidates, ctx)}""", "Research manager", errors)
@@ -262,7 +272,7 @@ out. Keeping none is acceptable on a bad day. Return a verdict for every candida
 def trader(llm, kept, ctx, verdict_text: str, errors: list[str] | None = None) -> TraderPlan | None:
     return _structured(llm, TraderPlan, f"""{GROUND_RULES}
 
-You are the TRADER. For each setup the research manager kept, write the order. Keep the \
+You are {team()['trader'].name}, the TRADER. For each setup the research manager kept, write the order. Keep the \
 scanner's entry, stop and target unless the debate gives a concrete reason to change them, \
 and say what you changed. Rules the desk enforces in code: a buy limit stays below the price \
 at scan time and a sell limit above it; the reward-to-risk after the spread stays at or above \
@@ -277,7 +287,8 @@ rule reverts to the scanner's levels.
 {evidence(kept, ctx)}""", "Trader", errors)
 
 
-def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx) -> str:
+def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx,
+                 heard: dict[str, str] | None = None) -> str:
     view = {
         "aggressive": "Argue for taking the strongest setups at full size and for which "
                       "lower-conviction ones still deserve a place.",
@@ -286,10 +297,18 @@ def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx) -> str:
         "conservative": "Argue for cutting anything exposed to a release before expiry, "
                         "anything stretched, and any stacked bet on one currency.",
     }[stance]
+    people = team()
+    replies = ""
+    for other, said in (heard or {}).items():
+        who = people[f"risk_{other}"].name
+        replies += f"\n\n## {who} ({other} risk analyst) said\n{said}"
+    if replies:
+        replies = ("\n\nRespond to your colleagues below by name: agree where they are right, "
+                   "push back where they are not." + replies)
     return _say(llm, f"""{GROUND_RULES}
 
-You are the {stance.upper()} RISK ANALYST reviewing the trader's book as a whole. {view} \
-Name specific symbols. Under 250 words.
+You are {people[f"risk_{stance}"].name}, the {stance.upper()} RISK ANALYST reviewing the trader's book as a whole. {view} \
+Name specific symbols. Under 250 words.{replies}
 
 ## Macro brief
 {macro}
@@ -304,7 +323,7 @@ def portfolio_manager(llm, plan_text, risk_views, macro, ctx, max_orders, max_pe
                       min_rr, errors: list[str] | None = None) -> FinalBook | None:
     return _structured(llm, FinalBook, f"""{GROUND_RULES}
 
-You are the PORTFOLIO MANAGER and make the final call. From the trader's book, choose at \
+You are {team()['portfolio_manager'].name}, the PORTFOLIO MANAGER, and make the final call. From the trader's book, choose at \
 most {max_orders} limit orders. At most {max_per_currency} may be long, or short, the same \
 currency (gold and silver count as trades against USD). Every order keeps at least \
 {min_rr:g}R after the spread. Set each order's validity so it is cancelled before any \
@@ -319,14 +338,14 @@ a rule reverts to the scanner's levels or is dropped.
 {plan_text}
 
 ## Risk team
-### Aggressive
+### {team()['risk_aggressive'].name} (aggressive)
 {risk_views['aggressive']}
 
-### Neutral
-{risk_views['neutral']}
-
-### Conservative
+### {team()['risk_conservative'].name} (conservative)
 {risk_views['conservative']}
+
+### {team()['risk_neutral'].name} (neutral)
+{risk_views['neutral']}
 
 Time now: {ctx.now:%A %H:%M} UTC""", "Portfolio manager", errors)
 
@@ -367,6 +386,36 @@ def _normal(symbol: str) -> str:
 # The review
 # ---------------------------------------------------------------------------
 
+def _opening(candidates: list[Setup], ctx: ReviewContext) -> str:
+    lines = [f"{len(candidates)} setup(s) passed the scanner at {ctx.now:%H:%M} UTC:"]
+    for c in candidates:
+        lines.append(f"• {c.symbol} {c.order_type} {c.entry} · SL {c.stop} · TP {c.target} · "
+                     f"{c.rr:.2f}R · score {c.score:.0f}")
+    if ctx.calendar_note:
+        lines.append(f"Calendar: {ctx.calendar_note}")
+    else:
+        events = sorted({e for evs in ctx.upcoming.values() for e in evs}, key=lambda e: e.time)
+        lines.append(f"Calendar: {len(events)} high/medium-impact release(s) before the orders expire"
+                     + (": " + "; ".join(e.describe() for e in events[:5]) if events else "."))
+    missing = [sym for sym, text in ctx.news.items() if text.startswith(("(news unavailable", "(FXStreet: no"))]
+    if missing:
+        lines.append(f"Headlines: none found for {', '.join(missing)}.")
+    return "\n".join(lines)
+
+
+def _closing(accepted: list[VerifiedOrder], dropped: list[tuple[str, str]]) -> str:
+    if not accepted:
+        lines = ["No orders passed. The desk sits out this round."]
+    else:
+        lines = [f"{len(accepted)} order(s) verified against live levels and sent to the journal:"]
+        for o in accepted:
+            lines.append(f"✓ {o.symbol} {o.order_type} {o.entry} · SL {o.stop} · TP {o.target} · "
+                         f"{o.rr:.2f}R · cancel {o.expires_at:%H:%M} UTC · {o.conviction}")
+            lines += [f"   note: {n}" for n in o.notes]
+    lines += [f"✕ {sym}: {why}" for sym, why in dropped]
+    return "\n".join(lines)
+
+
 def review(
     candidates: list[Setup],
     ctx: ReviewContext,
@@ -379,14 +428,30 @@ def review(
     progress: Progress | None = None,
     now: datetime | None = None,
 ) -> Review:
-    """Run the agent team over ``candidates`` and return the verified book."""
+    """Run the agent team over ``candidates`` and return the verified book.
+
+    Every step is also recorded, in order, in ``Review.messages``: the desk's
+    opening, each agent's argument (the bear answering the bull, each risk
+    analyst answering the last), the decisions, and the desk's verification.
+    """
     step = progress or (lambda _msg: None)
     now = now or ctx.now
+    people = team()
     by_symbol = {s.symbol: s for s in candidates}
     transcript: dict[str, str] = {}
+    messages: list[dict] = []
     fallbacks: list[str] = []
     dropped: list[tuple[str, str]] = []
     problems: list[str] = []          # one-line reasons, collected as agents fail
+
+    def post(key: str, title: str, text: str, kind: str = "message"):
+        who = people[key]
+        messages.append({"agent": key, "name": who.name, "role": who.role, "title": title,
+                         "kind": kind, "text": text})
+
+    def finish(**kw) -> Review:
+        return Review(transcript=transcript, messages=messages, fallbacks=fallbacks,
+                      problems=problems, **kw)
 
     def decide(make, label):
         """Strong model first, then the fast one: they often have separate quotas."""
@@ -401,24 +466,31 @@ def review(
     if not candidates:
         return Review(orders=[], dropped=[], summary="The scanner found no candidates to review.")
 
-    step("Macro analyst reading the calendar and headlines")
+    post("desk", "Scan", _opening(candidates, ctx), "system")
+
+    step(f"{people['macro'].name} reading the calendar and headlines")
     macro = _heard("Macro analyst", lambda: macro_analyst(quick_llm, candidates, ctx), problems)
     transcript["Macro analyst"] = macro
+    post("macro", "Macro brief", macro)
 
-    step("Price-action analyst reading the structure")
+    step(f"{people['price_action'].name} reading the structure")
     structure = _heard("Price-action analyst",
                        lambda: price_action_analyst(quick_llm, candidates, ctx), problems)
     transcript["Price-action analyst"] = structure
+    post("price_action", "Structure grades", structure)
 
-    step("Bull and bear researchers debating the setups")
+    step(f"{people['bull'].name} and {people['bear'].name} debating the setups")
     bull = _heard("Bull researcher",
                   lambda: researcher(quick_llm, "bull", candidates, ctx, macro, structure), problems)
+    post("bull", "The case for", bull)
     bear = _heard("Bear researcher",
-                  lambda: researcher(quick_llm, "bear", candidates, ctx, macro, structure), problems)
+                  lambda: researcher(quick_llm, "bear", candidates, ctx, macro, structure, rebut=bull),
+                  problems)
+    post("bear", f"Reply to {people['bull'].name}", bear)
     transcript["Bull researcher"] = bull
     transcript["Bear researcher"] = bear
 
-    step("Research manager judging the debate")
+    step(f"{people['research_manager'].name} judging the debate")
     verdict = decide(lambda llm: research_manager(llm, candidates, ctx, macro, bull, bear, problems,
                                                   structure),
                      "Research manager")
@@ -435,13 +507,14 @@ def review(
                 dropped.append((s.symbol, f"research manager: {reasons.get(s.symbol, 'no verdict given')}"))
         verdict_text = _render_verdict(verdict)
     transcript["Research manager"] = verdict_text
+    post("research_manager", "Verdict", verdict_text, "decision")
 
     if not kept:
-        return Review(orders=[], dropped=dropped, transcript=transcript, fallbacks=fallbacks,
-                      problems=problems,
+        post("desk", "Result", _closing([], dropped), "system")
+        return finish(orders=[], dropped=dropped,
                       summary=verdict.summary if verdict else "No setups survived the debate.")
 
-    step("Trader writing the orders")
+    step(f"{people['trader'].name} writing the orders")
     plan = trader(quick_llm, kept, ctx, verdict_text, problems)
     kept_symbols = {s.symbol for s in kept}
     if plan is None:
@@ -456,16 +529,22 @@ def review(
                 "note": "scanner levels"} for s in kept if s.symbol not in written]
     plan_text = _render_plan(orders, by_symbol)
     transcript["Trader"] = plan_text
+    post("trader", "Orders", plan_text, "decision")
 
-    step("Risk team reviewing the book")
-    risk_views = {stance: _heard(f"{stance.title()} risk analyst",
-                                 lambda stance=stance: risk_analyst(quick_llm, stance, plan_text, macro, ctx),
-                                 problems)
-                  for stance in ("aggressive", "neutral", "conservative")}
-    for stance, said in risk_views.items():
-        transcript[f"{stance.title()} risk analyst"] = said
+    step("Risk team debating the book")
+    risk_views: dict[str, str] = {}
+    for stance in ("aggressive", "conservative", "neutral"):
+        heard = dict(risk_views)
+        risk_views[stance] = _heard(
+            f"{stance.title()} risk analyst",
+            lambda stance=stance, heard=heard: risk_analyst(quick_llm, stance, plan_text, macro, ctx, heard),
+            problems)
+        transcript[f"{stance.title()} risk analyst"] = risk_views[stance]
+        title = {"aggressive": "Risk: press", "conservative": f"Reply to {people['risk_aggressive'].name}",
+                 "neutral": "Risk: weighing both"}[stance]
+        post(f"risk_{stance}", title, risk_views[stance])
 
-    step("Portfolio manager choosing the final orders")
+    step(f"{people['portfolio_manager'].name} choosing the final orders")
     book = decide(lambda llm: portfolio_manager(llm, plan_text, risk_views, macro, ctx,
                                                 max_orders, max_per_currency, min_rr, problems),
                   "Portfolio manager")
@@ -485,10 +564,14 @@ def review(
         for o in orders:
             if o["symbol"] not in chosen:
                 dropped.append((o["symbol"], "portfolio manager left it out of the final book"))
+        post("portfolio_manager", "Final book", transcript["Portfolio manager"], "decision")
 
     step("Verifying the orders")
     accepted, rejected = verify(proposals, candidates, now=now, min_rr=min_rr,
                                 max_orders=max_orders, max_per_currency=max_per_currency)
     dropped += [(sym, f"failed verification: {why}") for sym, why in rejected]
-    return Review(orders=accepted, dropped=dropped, summary=summary,
-                  transcript=transcript, fallbacks=fallbacks, problems=problems)
+    note = _closing(accepted, dropped)
+    if fallbacks or problems:
+        note += "\n" + "\n".join(f"! {x}" for x in problems + fallbacks)
+    post("desk", "Verification", note, "system")
+    return finish(orders=accepted, dropped=dropped, summary=summary)

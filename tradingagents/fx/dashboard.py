@@ -23,6 +23,7 @@ from tradingagents.fx.instruments import spec_for
 from tradingagents.fx.journal import Entry, Stats
 from tradingagents.fx.smc import NEW_YORK
 from tradingagents.fx.smc_scanner import ScanWindow, market_open
+from tradingagents.fx.team import Profile, team
 
 STATUS = {
     jr.PENDING: ("◌", "Pending", "pending"),
@@ -116,6 +117,33 @@ details summary{cursor:pointer;color:var(--accent-dim);font-size:12px;list-style
 details summary::-webkit-details-marker{display:none}
 details p{margin:6px 0 0;color:var(--text-2);max-width:60ch;font-size:12.5px}
 .foot{margin-top:18px;color:var(--muted);font-size:12px;line-height:1.6}
+.chat{display:grid;grid-template-columns:240px 1fr;gap:14px;min-height:420px}
+@media (max-width:900px){.chat{grid-template-columns:1fr}}
+.sessions{display:flex;flex-direction:column;gap:6px;max-height:620px;overflow-y:auto}
+.sessions button{all:unset;cursor:pointer;display:block;padding:9px 11px;border:1px solid var(--line);
+background:var(--panel-2);font-size:12px;color:var(--text-2)}
+.sessions button b{display:block;color:var(--text);font-family:ui-monospace,Menlo,monospace;font-weight:500;font-size:12.5px}
+.sessions button[aria-pressed="true"]{border-color:var(--accent-dim);box-shadow:inset 3px 0 0 var(--accent)}
+.sessions button:focus-visible{outline:1px solid var(--accent)}
+.log{display:flex;flex-direction:column;gap:12px;max-height:620px;overflow-y:auto;padding-right:6px}
+.msg{display:grid;grid-template-columns:40px 1fr;gap:10px}
+.av{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font:600 12px ui-monospace,Menlo,monospace;
+color:var(--text);background:#0d1a22;border:1.5px solid var(--ring,#2aa9b8);box-shadow:0 0 10px -2px var(--ring,#2aa9b8)}
+.who{font-size:12px;color:var(--text-2);margin-bottom:4px}.who b{color:var(--text);font-weight:600;letter-spacing:.04em}
+.who .t{display:inline-block;margin-left:8px;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.bubble{background:var(--panel-2);border:1px solid var(--line);padding:10px 12px;white-space:pre-wrap;font-size:13px;line-height:1.55;
+color:var(--text);overflow-wrap:anywhere}
+.msg.decision .bubble{border-color:var(--accent-dim);background:linear-gradient(90deg,rgba(92,225,240,.06),transparent 60%),var(--panel-2)}
+.msg.system .bubble{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--text-2);background:#091016}
+.team{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.card{border:1px solid var(--line);background:var(--panel-2);padding:14px}
+.card .top{display:flex;gap:12px;align-items:center;margin-bottom:10px}
+.card h3{margin:0;font-size:15px;letter-spacing:.06em}.card .r{font-size:12px;color:var(--text-2)}
+.card p{margin:8px 0 0;font-size:12.5px;color:var(--text-2);line-height:1.55}
+.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.tags span{font-size:10.5px;letter-spacing:.06em;padding:2px 7px;border:1px solid var(--line-2);color:var(--text-2)}
+.tier{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+a.disc{color:var(--accent);font-size:12px;text-decoration:none;display:inline-block;margin-top:4px}
 .tip{position:fixed;pointer-events:none;background:#0d1a22;border:1px solid var(--accent-dim);padding:6px 9px;
 font:12px ui-monospace,Menlo,monospace;color:var(--text);display:none;z-index:5;box-shadow:0 0 16px rgba(92,225,240,.2)}
 """
@@ -134,6 +162,37 @@ JS = """
       tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+12)+'px';});
     el.addEventListener('mouseleave',function(){tip.style.display='none';});
   });
+  var raw=document.getElementById('chat-data');var log=document.getElementById('log');
+  if(!raw||!log)return;
+  var data=JSON.parse(raw.textContent);var byId={};
+  data.reviews.forEach(function(r){byId[r.id]=r;});
+  function text(parent,str){            // plain text, with **bold** kept: never parsed as HTML
+    str.split('**').forEach(function(part,i){
+      if(!part)return;var node=i%2?document.createElement('b'):document.createTextNode(part);
+      if(i%2)node.textContent=part;parent.appendChild(node);});
+  }
+  function show(id){
+    var r=byId[id];if(!r)return;log.textContent='';
+    document.querySelectorAll('.sessions button').forEach(function(b){
+      b.setAttribute('aria-pressed',b.getAttribute('data-review')===id?'true':'false');});
+    r.messages.forEach(function(m){
+      var row=document.createElement('div');row.className='msg '+(m.kind||'message');
+      var av=document.createElement('div');av.className='av';av.textContent=(m.name||'?').slice(0,2).toUpperCase();
+      av.style.setProperty('--ring',data.accents[m.agent]||'#2aa9b8');
+      var body=document.createElement('div');var who=document.createElement('div');who.className='who';
+      var b=document.createElement('b');b.textContent=m.name;who.appendChild(b);
+      who.appendChild(document.createTextNode(' · '+(m.role||'')));
+      var t=document.createElement('span');t.className='t';t.textContent=m.title||'';who.appendChild(t);
+      var bubble=document.createElement('div');bubble.className='bubble';text(bubble,m.text||'');
+      body.appendChild(who);body.appendChild(bubble);row.appendChild(av);row.appendChild(body);log.appendChild(row);
+    });
+    log.scrollTop=0;
+  }
+  document.querySelectorAll('.sessions button').forEach(function(b){
+    b.addEventListener('click',function(){show(b.getAttribute('data-review'));});});
+  document.querySelectorAll('a.disc').forEach(function(a){
+    a.addEventListener('click',function(){show(a.getAttribute('data-review'));});});
+  if(data.reviews.length)show(data.reviews[0].id);
 })();
 """
 
@@ -271,7 +330,8 @@ def _breakdown(title: str, groups: dict[str, dict]) -> str:
     return head + f'<div class="bars">{"".join(rows)}</div></div>'
 
 
-def _table(entries: list[Entry]) -> str:
+def _table(entries: list[Entry], linked: set[str] | None = None) -> str:
+    linked = linked or set()
     head = '<div class="panel" style="margin-top:14px"><h2><i>◆</i> Journal <span style="color:var(--muted)">· every final order</span></h2>'
     if not entries:
         return head + ('<div class="empty">The journal is empty. It fills as the agents give final orders '
@@ -284,6 +344,9 @@ def _table(entries: list[Entry]) -> str:
                      f"<p><b>Watch for:</b> {escape(e.watch_for)}</p>" if e.watch_for else "",
                      f"<p><b>Outcome:</b> {escape(e.note)}</p>" if e.note else ""]
             why = f'<details><summary>reasoning ▸</summary>{"".join(parts)}</details>'
+        if e.review_id in linked:
+            why += (f'<a class="disc" href="#chat" data-review="{escape(e.review_id, quote=True)}">'
+                    'desk chat ▸</a>')
         rows.append(f"""<tr><td class="mono">{_ny(e.created_at)}</td><td><b>{escape(e.symbol)}</b><br>
 <span style="color:var(--text-2);font-size:12px">{e.order_type}</span></td>
 <td class="n">{_p(e.symbol, e.entry)}</td><td class="n">{_p(e.symbol, e.stop)}</td><td class="n">{_p(e.symbol, e.target)}</td>
@@ -294,10 +357,49 @@ def _table(entries: list[Entry]) -> str:
 <th class="n">Result</th><th>Why</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></div>"""
 
 
+def _chat(reviews: list[dict]) -> str:
+    head = ('<div class="panel" id="chat" style="margin-top:14px"><h2><i>◆</i> Desk chat '
+            '<span style="color:var(--muted)">· how each decision was argued</span></h2>')
+    if not reviews:
+        return head + ('<div class="empty">No conversations yet. Each agent review is saved here, '
+                       'from the scan to the final check.</div></div>')
+    buttons = []
+    for i, r in enumerate(reviews):
+        at = datetime.fromisoformat(r["at"])
+        label = f"{r['orders']} order{'s' if r['orders'] != 1 else ''}" if r["orders"] else "no orders"
+        buttons.append(f'<button type="button" data-review="{escape(r["id"], quote=True)}" '
+                       f'aria-pressed="{"true" if i == 0 else "false"}"><b>{_ny(at)}</b>{escape(label)}</button>')
+    return head + (f'<div class="chat"><div class="sessions" role="list">{"".join(buttons)}</div>'
+                   f'<div class="log" id="log" aria-live="polite"></div></div></div>')
+
+
+def _team(people: dict[str, Profile]) -> str:
+    tiers = {"deep": "Strong model", "quick": "Fast model", "code": "Rule engine"}
+    cards = []
+    for p in people.values():
+        initials = escape(p.name[:2].upper())
+        tags = "".join(f"<span>{escape(t)}</span>" for t in p.expertise)
+        cards.append(f"""<div class="card"><div class="top"><div class="av" style="--ring:{escape(p.accent, quote=True)}">{initials}</div>
+<div><h3>{escape(p.name)}</h3><div class="r">{escape(p.role)}</div><div class="tier">{tiers.get(p.tier, p.tier)}</div></div></div>
+<div class="tags">{tags}</div><p>{escape(p.bio)}</p></div>""")
+    return ('<div class="panel" style="margin-top:14px"><h2><i>◆</i> The desk '
+            f'<span style="color:var(--muted)">· who decides</span></h2><div class="team">{"".join(cards)}</div></div>')
+
+
+def _json_script(element_id: str, data) -> str:
+    """Embed ``data`` for the page script; ``</`` is escaped so text cannot close the tag."""
+    text = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return f'<script type="application/json" id="{element_id}">{text}</script>'
+
+
 def render(entries: list[Entry], s: Stats, *, now: datetime | None = None, live: bool = False,
-           window: ScanWindow | None = None, last_cycle: str = "") -> str:
+           window: ScanWindow | None = None, last_cycle: str = "",
+           reviews: list[dict] | None = None) -> str:
     now = now or datetime.now(UTC)
     window = window or ScanWindow()
+    reviews = reviews or []
+    people = team()
+    accents = {p.key: p.accent for p in people.values()}
     closes = window.current_end(now)
     if closes:
         win = f'<span><i class="dot on"></i>Window <b>open</b> · closes {_ny(closes, "%H:%M")} NY</span>'
@@ -322,12 +424,15 @@ def render(entries: list[Entry], s: Stats, *, now: datetime | None = None, live:
 <div class="grid top">{_ring(s)}{_tiles(s)}</div>
 <div class="grid mid">{_curve(s, finished)}{_live(entries)}</div>
 <div class="grid low">{_breakdown("By symbol", s.by_symbol)}{_breakdown("By conviction", s.by_conviction)}</div>
-{_table(entries)}
+{_table(entries, {r["id"] for r in reviews})}
+{_chat(reviews)}
+{_team(people)}
 <div class="foot">Paper results: each order is replayed on OANDA one-minute mid prices after it was suggested. A loss is −1R;
 a win or a close at the New York 17:00 close is charged the spread recorded at the scan. A minute that touches the entry
 and target together counts as no fill, and one that touches the stop and target as the stop. Real fills differ.
 Generated {_ny(now)} New York.</div></div>
 <div class="tip" id="tip"></div><script type="application/json" id="summary">{escape(data)}</script>
+{_json_script("chat-data", {"reviews": reviews, "accents": accents})}
 <script>{JS}</script></body></html>"""
 
 
