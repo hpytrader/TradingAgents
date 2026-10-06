@@ -85,6 +85,10 @@ def check_levels(setup: Setup, entry: float, stop: float, target: float,
         return "for a buy the stop must be below the entry and the target above it"
     if not long and not target < entry < stop:
         return "for a sell the stop must be above the entry and the target below it"
+    if long and target <= setup.price:
+        return f"the target must sit above the price at scan time ({setup.price}); it is already reached"
+    if not long and target >= setup.price:
+        return f"the target must sit below the price at scan time ({setup.price}); it is already reached"
     if long and entry >= setup.price:
         return f"a buy limit must sit below the price at scan time ({setup.price})"
     if not long and entry <= setup.price:
