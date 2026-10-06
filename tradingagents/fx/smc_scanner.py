@@ -37,6 +37,7 @@ M5_BARS = 600
 SWEEP_LOOKBACK = 72        # M5 bars (6 hours) searched for a sweep
 CHOCH_WITHIN = 36          # M5 bars (3 hours) after the sweep for the shift to come
 MAX_TARGET_H1_ATR = 3.0    # beyond this an intraday target is a stretch
+MIN_RISK_H1_ATR = 0.35     # a stop closer than this (in 1-hour ATRs) is inside normal noise
 STALE_AFTER = timedelta(minutes=30)
 
 
@@ -170,26 +171,39 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
     sign = 1 if long else -1
     ob = smc.order_block(m5, sweep.i, shift.i, up)
     gaps = smc.fair_value_gaps(m5, sweep.i, shift.i, up)
-    zone, confluence = None, ""
-    if gaps:
-        inside = [g for g in gaps if ob and g.overlaps(ob)]
-        if inside:
-            zone, confluence = inside[-1], "fair value gap inside the order block"
-        else:
-            zone, confluence = gaps[-1], "fair value gap"
-    elif ob:
-        zone, confluence = ob, "order block"
+    # Zones in order of preference: a gap inside the order block, other gaps
+    # (newest first), then the order block itself. The first one price has
+    # not come back to is the entry; a zone already traded into would have
+    # filled the limit already.
+    options = [(g, "fair value gap inside the order block") for g in reversed(gaps) if ob and g.overlaps(ob)]
+    options += [(g, "fair value gap") for g in reversed(gaps) if not (ob and g.overlaps(ob))]
+    if ob:
+        options.append((ob, "order block"))
+    if not options:
+        return "structure shift without an order block or fair value gap to enter at"
+
+    zone = confluence = None
+    for candidate, label in options:
+        if smc.mitigated(m5, candidate, candidate.mid, up, after=shift.i):
+            continue
+        if (mid - candidate.mid) * sign <= spread:
+            continue
+        zone, confluence = candidate, label
+        break
     if zone is None:
-        return "change of character without an order block or fair value gap to enter at"
+        kinds = " and ".join(sorted({z.kind for z, _ in options}))
+        return f"every {kinds} from the move has already been traded back into"
 
     entry = zone.mid
-    if smc.mitigated(m5, zone, entry, up):
-        return f"the {zone.kind} has already been traded back into"
-    if (mid - entry) * sign <= spread:
-        return f"price is already at the {zone.kind}; a limit would fill at market"
-
     buffer = max(3 * spread, 0.3 * atr5)
     stop = sweep.extreme - sign * buffer
+    widened = False
+    if abs(entry - stop) < MIN_RISK_H1_ATR * atr1:
+        # In a quiet market the sweep wick can sit almost on the entry; a stop
+        # a pip away is noise, not invalidation. Keep it beyond the sweep, but
+        # never closer than a fraction of the hourly range.
+        stop = entry - sign * MIN_RISK_H1_ATR * atr1
+        widened = True
     risk = abs(entry - stop)
 
     target, target_name = _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5)
@@ -221,7 +235,11 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         price=spec.round_price(mid),
         target_kind=target_name,
         expires_at=expires,
-        reasons=reasons + [f"{session_name} session; cancel at {expires:%H:%M} UTC if unfilled"],
+        reasons=reasons
+        + ([f"stop widened to the minimum {MIN_RISK_H1_ATR}× 1h ATR "
+            f"({spec.pips(MIN_RISK_H1_ATR * atr1):.1f} pips); the sweep wick sat too close to the entry"]
+           if widened else [])
+        + [f"{session_name} session; cancel at {expires:%H:%M} UTC if unfilled"],
         strategy="smc",
         zone_low=spec.round_price(zone.low),
         zone_high=spec.round_price(zone.high),
