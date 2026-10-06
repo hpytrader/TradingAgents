@@ -339,6 +339,8 @@ def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr
     limit = MAX_TARGET_H1_ATR * atr1
     for level, name in beyond:
         target = level - sign * 0.1 * atr5           # exit just before the pool
+        if (target - mid) * sign <= spread:
+            continue        # the pool is so close that the exit would sit behind price
         reward = (target - entry) * sign
         if reward > limit:
             break

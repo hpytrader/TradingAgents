@@ -297,6 +297,8 @@ def _target(c: _Context, entry: float, risk: float, opposing: list[float],
     limit = MAX_TARGET_ATR * c.atr1
     for level in beyond:
         target = level - sign * ENTRY_BUFFER_ATR * c.atr1   # exit before the crowd
+        if (target - c.mid) * sign <= c.spread:
+            continue        # the pool is so close that the exit would sit behind price
         reward = (target - entry) * sign
         if reward > limit:
             break

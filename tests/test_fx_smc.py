@@ -392,3 +392,18 @@ def test_fxstreet_headlines_match_pairs_by_currency():
     assert fxstreet.headlines_for("USDCAD", now, items=items)[0].title.startswith("US ISM")
     assert all("Decade" not in h.title for h in fxstreet.headlines_for("USDCAD", now, items=items))
     assert len(fxstreet.market_headlines(now, items=items)) == 4     # the old story is outside 12h
+
+
+@pytest.mark.unit
+def test_the_target_skips_a_pool_sitting_right_at_price():
+    from tradingagents.fx import smc_scanner
+    from tradingagents.fx.smc import Pool
+
+    m5, h1 = _m5(), _h1()
+    mid, atr5 = float(m5["close"].iloc[-1]), smc.atr(m5)
+    hair = Pool("equal highs", mid + 0.05 * atr5, "high", 1)          # just above price
+    far = Pool("previous day high", mid + 6 * atr5, "high", 3)
+    target, name = smc_scanner._target(m5, h1, [hair, far], True, mid, mid - 2 * atr5,
+                                       1.5 * atr5, 0.00005, 2.0, smc.atr(h1), atr5)
+    assert name != "equal highs"
+    assert target > mid

@@ -95,7 +95,7 @@ def test_scanner_levels_pass_their_own_check():
     ({"entry": 1.1730}, "below the price"),          # buy limit above market
     ({"stop": 1.1710}, "stop must be below"),       # stop above entry
     ({"stop": 1.16955}, "tighter than"),            # 4.5-pip stop on a 15-pip ATR
-    ({"target": 1.1720}, "RR after the spread"),    # 2R needs more room
+    ({"target": 1.1730}, "RR after the spread"),    # 1.6R: 2R needs more room
     ({"entry": 1.1660, "stop": 1.1640}, "moved"),   # 40 pips from the level
 ])
 def test_bad_levels_are_named(change, problem):
@@ -417,3 +417,11 @@ def test_an_smc_order_cannot_outlive_its_session():
                            "valid_hours": 6}], [s], now=NOW)
     assert accepted[0].expires_at == NOW + timedelta(hours=1)
     assert "scanner's limit" in accepted[0].notes[0]
+
+
+@pytest.mark.unit
+def test_a_target_already_behind_price_is_refused():
+    s = _setup()                                   # price 1.1720, a buy below it
+    assert "already reached" in check_levels(s, s.entry, s.stop, 1.1718, 2.0)
+    short = _setup("USDJPY", "short")
+    assert "already reached" in check_levels(short, short.entry, short.stop, 150.25, 2.0)
