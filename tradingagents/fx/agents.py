@@ -40,6 +40,8 @@ time (no later than the end of the morning scan window, 12:00 New York by defaul
 earlier for a release. A filled trade is \
 managed only by its stop and target and is closed at the New York 17:00 close (21:00 UTC in \
 summer, 22:00 UTC in winter) at the latest; nothing is held overnight.
+A release after today's New York close cannot affect any of today's orders or trades: when a \
+headline mentions an event, find its time in the calendar before treating it as a risk.
 Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
 previous values but never the actual result; an actual figure is known only if a headline \
 reports it. A rule-based scanner found the candidates; its levels and figures are facts. Your \
@@ -96,10 +98,12 @@ def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
     else:
         events = ctx.upcoming.get(s.symbol, [])
         if events:
-            lines.append("- Releases before expiry:")
-            lines += [f"  - {e.describe()}" for e in events]
+            lines.append("- Releases before the New York 17:00 close (a filled order can run until then):")
+            lines += [f"  - {e.describe()}"
+                      + (" (after the order's cancel time: matters only if it has filled)" if e.time > s.expires_at else "")
+                      for e in events]
         else:
-            lines.append("- Releases before expiry: no high- or medium-impact events listed")
+            lines.append("- Releases before the New York close: no high- or medium-impact events listed")
     return "\n".join(lines)
 
 
@@ -117,11 +121,21 @@ def macro_evidence(candidates: list[Setup], ctx: ReviewContext) -> str:
         parts += ["## Released in the last 12 hours"]
         parts += [f"- {e.describe()}" for e in ctx.recent] or ["- nothing high or medium impact"]
         parts.append("")
-        parts.append("## Coming up before the candidates expire")
+        parts.append("## Coming up before the New York 17:00 close")
         upcoming = sorted({e for evs in ctx.upcoming.values() for e in evs}, key=lambda e: e.time)
         parts += [f"- {e.describe()}" for e in upcoming] or ["- nothing high or medium impact"]
         parts.append("")
-    parts += ["## Candidates", ", ".join(f"{s.symbol} {s.direction}" for s in candidates), ""]
+        if ctx.later:
+            parts.append("## Later this week: after today's New York close, so no effect on today's trades")
+            parts += [f"- {e.describe()}" for e in ctx.later[:12]]
+            parts.append("")
+    parts += ["## Candidates and live trades"]
+    for s in candidates:
+        ticket = ctx.tickets.get(s.symbol, "") or getattr(s, "ticket", "")
+        until = getattr(s, "expires_at", None)
+        parts.append(f"- {ticket + ' ' if ticket else ''}{s.symbol} {s.direction}"
+                     + (f", order cancels {until:%H:%M} UTC if unfilled" if until else ""))
+    parts.append("")
     for s in candidates:
         if ctx.news.get(s.symbol):
             parts += [f"## Headlines: {s.symbol}", ctx.news[s.symbol], ""]
@@ -427,7 +441,7 @@ def _opening(candidates: list[Setup], ctx: ReviewContext) -> str:
         lines.append(f"Calendar: {ctx.calendar_note}")
     else:
         events = sorted({e for evs in ctx.upcoming.values() for e in evs}, key=lambda e: e.time)
-        lines.append(f"Calendar: {len(events)} high/medium-impact release(s) before the orders expire"
+        lines.append(f"Calendar: {len(events)} high/medium-impact release(s) before the New York close"
                      + (": " + "; ".join(e.describe() for e in events[:5]) if events else "."))
     missing = [sym for sym, text in ctx.news.items() if text.startswith(("(news unavailable", "(FXStreet: no"))]
     if missing:
@@ -680,7 +694,8 @@ def check_trades(
     post("desk", "Ward check", f"Scheduled check of the live book: {live} open, "
                                f"{len(positions) - live} pending.\n{book_text}", "system")
 
-    trades = [SimpleNamespace(symbol=p.entry.symbol, direction=p.entry.direction) for p in positions]
+    trades = [SimpleNamespace(symbol=p.entry.symbol, direction=p.entry.direction, ticket=p.entry.ticket)
+              for p in positions]
     evidence_text = macro_evidence(trades, ctx)        # calendar and headlines for these currencies
 
     plan = trade_manager(deep_llm, book_text, evidence_text, ctx, problems)

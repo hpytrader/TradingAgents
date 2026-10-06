@@ -34,7 +34,7 @@ def _wave(start_t, n, start, end, amp=0.0003):
     return rows
 
 
-def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729, spent=False):
+def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729, spent=False, deeper=False):
     t = datetime(2026, 10, 4, 21, 0, tzinfo=UTC)          # previous trading day starts
     rows = []
     rows += _wave(t, 144, 1.1720, 1.1790)                   # Oct 5 to 09:00: up to the day high
@@ -60,6 +60,8 @@ def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729, spent=False):
     t = datetime(2026, 10, 6, 7, 35, tzinfo=UTC)
     low, ob_low = (1.1712, 1.1719) if sweep else (1.1722, 1.1721)   # no bar under 1.1720
     rows.append(_bar(t, 1.1728, 1.1729, low, 1.1724))        # the sweep of the Asian low
+    if deeper:                       # price keeps falling a candle after the sweep before it turns
+        ob_low = 1.1705
     rows.append(_bar(t + timedelta(minutes=5), 1.1726, 1.1727, ob_low, 1.1722))   # order block
     rows.append(_bar(t + timedelta(minutes=10), 1.1722, 1.1735, 1.1721, 1.1734))  # displacement
     rows.append(_bar(t + timedelta(minutes=15), 1.1734, 1.1746, 1.1733, 1.1745))  # CHoCH
@@ -458,3 +460,23 @@ def test_a_level_closed_through_cannot_be_swept_later():
     assert smc.sweeps(frame, [pool], "low", 0) == []                 # bar 1 closed below: broken
     intact = Pool("swing low", 0.97, "low", 0, formed_i=1)
     assert [s.i for s in smc.sweeps(frame, [intact], "low", 0)] == [2]
+
+
+@pytest.mark.unit
+def test_invalidation_is_the_low_of_the_whole_move_not_the_sweep_wick():
+    # 2026-10-06: GBPUSD, AUDJPY and GBPJPY longs came with the buy limit below
+    # their "sweep extreme", because price fell further after the sweeping
+    # candle. The real invalidation is the lowest low between sweep and shift.
+    candles, quote = _fetchers(_m5(deeper=True), _h1())
+    s = scan_smc(candles, quote, ["EURUSD"], now=NOW).setups[0]
+    assert s.invalidation == pytest.approx(1.1705)               # not the 07:35 wick at 1.1712
+    assert s.stop < s.invalidation < s.entry
+    assert "beyond the low of the move" not in " ".join(s.reasons)
+
+
+@pytest.mark.unit
+def test_verification_refuses_an_smc_entry_past_invalidation():
+    candles, quote = _fetchers(_m5(), _h1())
+    s = scan_smc(candles, quote, ["EURUSD"], now=NOW).setups[0]
+    s.zone_low = s.invalidation - 0.0005                          # a zone reaching past the low
+    assert "past invalidation" in check_levels(s, s.invalidation - 0.0001, s.stop - 0.0010, s.target, 2.0)

@@ -425,3 +425,44 @@ def test_a_target_already_behind_price_is_refused():
     assert "already reached" in check_levels(s, s.entry, s.stop, 1.1718, 2.0)
     short = _setup("USDJPY", "short")
     assert "already reached" in check_levels(short, short.entry, short.stop, 150.25, 2.0)
+
+
+@pytest.mark.unit
+def test_atlas_sees_tickets_and_cancel_times():
+    s = _setup()
+    ctx = ReviewContext(now=NOW, tickets={"EURUSD": "#1016"})
+    text = fx_agents.macro_evidence([s], ctx)
+    assert "#1016 EURUSD long, order cancels 19:00 UTC if unfilled" in text
+    assert "before the New York 17:00 close" in text
+
+
+@pytest.mark.unit
+def test_the_calendar_reaches_the_new_york_close_and_marks_late_events():
+    s = _setup()                                     # cancels 19:00 UTC; the close is 21:00 UTC
+    ends = []
+
+    def calendar(start, end, currencies):
+        ends.append(end)
+        return [forex_calendar.Event("FOMC Meeting Minutes", "USD", NOW + timedelta(hours=9), "High")]
+
+    ctx = gather([s], NOW, calendar=calendar, news=None, global_news=None)
+    assert ends[0] == datetime(2026, 10, 6, 21, 0, tzinfo=UTC)          # the setup's window, to the close
+    text = fx_agents.describe_candidate(s, ctx)
+    assert "FOMC Meeting Minutes" in text and "after the order's cancel time" in text
+
+
+@pytest.mark.unit
+def test_later_high_impact_releases_are_dated_for_the_agents():
+    minutes = forex_calendar.Event("FOMC Meeting Minutes", "USD", datetime(2026, 10, 7, 18, 0, tzinfo=UTC), "High")
+    speech = forex_calendar.Event("FOMC Member Waller Speaks", "USD", datetime(2026, 10, 8, 8, 30, tzinfo=UTC), "Medium")
+
+    def calendar(start, end, currencies):
+        return [e for e in (minutes, speech) if start <= e.time <= end]
+
+    ctx = gather([_setup()], NOW, calendar=calendar, news=None, global_news=None)
+    assert ctx.later == [minutes] and ctx.upcoming["EURUSD"] == []
+    text = fx_agents.macro_evidence([_setup()], ctx)
+    assert "Later this week: after today's New York close" in text
+    assert "Wed 18:00 UTC · USD · High: FOMC Meeting Minutes" in text
+    assert "Waller" not in text                              # only high impact is listed
+    assert "find its time in the calendar" in fx_agents.GROUND_RULES
