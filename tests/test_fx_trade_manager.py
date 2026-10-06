@@ -231,3 +231,129 @@ def test_dashboard_shows_tickets_and_the_change_history(tmp_path):
 @pytest.mark.unit
 def test_fake_llm_helper_still_answers():
     assert FakeLLM("x").invoke("hi").content.startswith("x says")
+
+
+# ---------------------------------------------------------------------------
+# Ward's own checks, on a timer
+# ---------------------------------------------------------------------------
+
+def _ward_harness(tmp_path, plan):
+    from test_fx_watch import Harness
+
+    from tradingagents.fx.context import ReviewContext
+
+    book, e = _open_trade(tmp_path)
+    h = Harness(tmp_path, [])
+    h.book = book
+    calls = []
+
+    def ward_fn(now):
+        calls.append(now)
+        positions = snapshot(book.entries(jr.ACTIVE), lambda s, g, n: _bars((1.1705, 1.1725, 1.1699, 1.1720)),
+                             _quote(1.1720), now)
+        deep = FakeLLM("deep", {ManagementPlan: plan(e)})
+        return fx_agents.check_trades(positions, ReviewContext(now=now), FakeLLM("quick"), deep, now=now)
+
+    return h, e, ward_fn, calls
+
+
+@pytest.mark.unit
+def test_ward_checks_open_trades_on_a_timer_even_without_new_setups(tmp_path):
+    plan = lambda e: ManagementPlan(summary="Protect it.", actions=[  # noqa: E731
+        TradeAction(ticket=e.ticket, action="move_stop", new_stop=1.1700, reason="breakeven at +1R")])
+    h, e, ward_fn, calls = _ward_harness(tmp_path, plan)
+    t = T0 + timedelta(minutes=30)                  # 07:30 New York, inside the window, no setups
+
+    first = h.run(t, ward_fn=ward_fn, ward_every=timedelta(minutes=30))
+    assert first.ward_checked and not first.reviewed and len(calls) == 1
+    assert h.book.entries()[0].stop == 1.17
+    assert any("stop moved 1.168 → 1.17" in m for m in h.sent)
+    saved = h.book.reviews()[0]["messages"]
+    assert [m["agent"] for m in saved] == ["desk", "trade_manager", "desk"]
+    assert "Scheduled check" in saved[0]["text"] and "#1001 EURUSD" in saved[0]["text"]
+
+    assert not h.run(t + timedelta(minutes=10), ward_fn=ward_fn).ward_checked     # not due yet
+    assert h.run(t + timedelta(minutes=31), ward_fn=ward_fn).ward_checked         # due again
+    assert len(calls) == 2
+
+
+@pytest.mark.unit
+def test_ward_keeps_watching_after_the_window_closes(tmp_path):
+    plan = lambda e: ManagementPlan(summary="Hold.", actions=[  # noqa: E731
+        TradeAction(ticket=e.ticket, action="hold", reason="on track")])
+    h, e, ward_fn, calls = _ward_harness(tmp_path, plan)
+    after = h.run(datetime(2026, 10, 6, 17, 0, tzinfo=UTC), ward_fn=ward_fn)     # 13:00 New York
+    assert not after.in_window and after.ward_checked
+    assert h.book.entries()[0].stop == 1.168                                       # held
+
+
+@pytest.mark.unit
+def test_a_review_that_included_ward_resets_his_timer(tmp_path):
+    from test_fx_watch import Harness, _setup as watch_setup
+
+    book, e = _open_trade(tmp_path)
+    h = Harness(tmp_path, [watch_setup("GBPUSD")])
+    h.book = book
+    calls = []
+    inner = h.review
+
+    def review_with_ward(result, now):
+        out, path = inner(result, now)
+        out.positions = ["Ward was here"]
+        return out, path
+
+    h.review = review_with_ward
+    c = h.run(T0 + timedelta(minutes=30), ward_fn=lambda now: calls.append(now))
+    assert c.reviewed and not c.ward_checked and calls == []
+
+
+@pytest.mark.unit
+def test_no_live_trades_no_ward_check(tmp_path):
+    from test_fx_watch import Harness
+
+    h = Harness(tmp_path, [])
+    calls = []
+    assert not h.run(T0 + timedelta(minutes=30), ward_fn=lambda now: calls.append(now)).ward_checked
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_a_failed_ward_check_is_noted_and_retried_next_interval(tmp_path):
+    h, e, _, _ = _ward_harness(tmp_path, lambda e: None)
+    t = T0 + timedelta(minutes=30)
+
+    def boom(now):
+        raise RuntimeError("quota")
+    c = h.run(t, ward_fn=boom)
+    assert "trade manager check failed: quota" in c.notes
+    assert not h.run(t + timedelta(minutes=5), ward_fn=boom).notes                 # waits for the interval
+
+
+@pytest.mark.unit
+def test_dashboard_labels_ward_sessions(tmp_path):
+    plan = lambda e: ManagementPlan(summary="Hold.", actions=[  # noqa: E731
+        TradeAction(ticket=e.ticket, action="hold", reason="fine")])
+    h, e, ward_fn, _ = _ward_harness(tmp_path, plan)
+    h.run(T0 + timedelta(minutes=30), ward_fn=ward_fn)
+    page = dashboard.render(h.book.entries(), stats(h.book.entries()), now=T0, reviews=h.book.reviews())
+    assert "Ward check · held" in page
+
+
+@pytest.mark.unit
+def test_minutes_spent_deciding_are_settled_before_a_change(tmp_path):
+    # The trade hits its target while the agents are thinking; Ward's later
+    # stop move must not erase that, and is refused because the trade is done.
+    book, e = _open_trade(tmp_path)
+    positions = snapshot(book.entries(jr.ACTIVE), lambda s, g, n: _bars((1.1705, 1.1725, 1.1699, 1.1720)),
+                         _quote(1.1720), T0 + timedelta(minutes=2))
+    review = SimpleNamespace(management=[{"ticket": e.ticket, "action": "move_stop", "new_stop": 1.1700,
+                                          "reason": "breakeven"}],
+                             positions=positions, messages=[], orders=[], summary="")
+    hit = _bars((1.1705, 1.1706, 1.1699, 1.1702), (1.1740, 1.1762, 1.1739, 1.1760), start=T0)
+    sent = []
+    _, applied = file_review(review, book, now=T0 + timedelta(minutes=3), notify=sent.append,
+                             candles=lambda s, g, n: hit)
+    done = book.entries()[0]
+    assert done.status == jr.WON and done.stop == 1.168
+    assert applied[0].ok is False and "already finished (won)" in applied[0].text
+    assert any("WON #1001 EURUSD" in m for m in sent)

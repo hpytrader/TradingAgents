@@ -117,7 +117,13 @@ class Applied:
 
 def apply(actions: list[dict], positions: list[Position], journal: Journal, *, now: datetime,
           by: str = "Ward") -> list[Applied]:
-    """Check and apply the trade manager's actions; refused ones are reported, not applied."""
+    """Check and apply the trade manager's actions; refused ones are reported, not applied.
+
+    Each trade is re-read from the journal first: the decision may have taken a
+    minute or two, and a trade that has since filled, hit its target or its stop
+    is acted on as it is now, or not at all.
+    """
+    current = {e.id: e for e in journal.entries()}
     by_ticket = {p.ticket: p for p in positions}
     results: list[Applied] = []
     for a in actions:
@@ -129,8 +135,14 @@ def apply(actions: list[dict], positions: list[Position], journal: Journal, *, n
         p = by_ticket.get(ticket)
         if p is None:
             continue                                  # not a live trade: nothing to do
-        e, spec = p.entry, spec_for(p.entry.symbol)
+        e = current.get(p.entry.id, p.entry)
+        p.entry = e
+        spec = spec_for(e.symbol)
         if action == "hold":
+            continue
+        if e.status not in (PENDING, OPEN):
+            results.append(Applied(e, action, f"{e.label}: {action} not applied, the trade "
+                                              f"already finished ({e.status})", False))
             continue
 
         def refuse(why: str, e=e, action=action):

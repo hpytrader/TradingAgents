@@ -19,12 +19,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
 from tradingagents.fx import smc
-from tradingagents.fx.journal import Change, Entry, Journal, stats
+from tradingagents.fx.journal import ACTIVE, Change, Entry, Journal, stats
 from tradingagents.fx.scanner import ScanResult, Setup
 from tradingagents.fx.smc_scanner import ScanWindow
 from tradingagents.fx.telegram import order_message, result_message, summary_message
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 Notify = Callable[[str], None]
 ScanFn = Callable[[datetime], ScanResult]
 ReviewFn = Callable[[ScanResult, datetime], tuple[object | None, str]]   # (Review, report path)
+WardFn = Callable[[datetime], object | None]                             # live-book check -> Review
 
 
 @dataclass
@@ -43,6 +44,7 @@ class WatchState:
     agent_runs: int = 0
     cap_warned: bool = False
     in_window: bool = False
+    last_ward: datetime | None = None      # when the trade manager last looked at the live book
 
 
 @dataclass
@@ -53,12 +55,13 @@ class Cycle:
     candidates: int = 0
     new_setups: int = 0
     reviewed: bool = False
+    ward_checked: bool = False
     new_orders: list[Entry] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
 def file_review(review, journal: Journal, *, now: datetime, report: str = "",
-                notify: Notify | None = None) -> tuple[list[Entry], list]:
+                notify: Notify | None = None, candles=None) -> tuple[list[Entry], list]:
     """After a review: apply the trade manager's actions, then save the chat and the new orders.
 
     Returns the new journal entries and the trade-manager results. Ward's
@@ -70,6 +73,16 @@ def file_review(review, journal: Journal, *, now: datetime, report: str = "",
 
     applied = []
     actions = getattr(review, "management", None) or []
+    if actions and candles is not None:
+        # Replay prices up to the decision before changing anything: a change
+        # applies from now on, so the minutes the agents spent thinking must be
+        # settled under the old stop and target first.
+        try:
+            for change in journal.settle(candles, now):
+                if notify:
+                    notify(result_message(change.entry))
+        except Exception:
+            pass
     if actions:
         applied = apply(actions, getattr(review, "positions", []) or [], journal, now=now,
                         by=team()["trade_manager"].name)
@@ -108,8 +121,16 @@ def cycle(
     notify: Notify,
     state: WatchState,
     max_agent_runs: int = 12,
+    ward_fn: WardFn | None = None,
+    ward_every: timedelta = timedelta(minutes=30),
 ) -> Cycle:
-    """Run one watcher cycle at ``now``; never raises for a data or model problem."""
+    """Run one watcher cycle at ``now``; never raises for a data or model problem.
+
+    After the scan, when trades are pending or open and the trade manager has
+    not looked at them for ``ward_every`` (in a full review or on his own),
+    ``ward_fn`` runs his check. That happens inside and outside the scan
+    window, so open trades are watched until they finish.
+    """
     day = smc.trading_day(pd.Timestamp(now))
     if state.day != day:
         state.day, state.seen, state.agent_runs, state.cap_warned = day, set(), 0, False
@@ -127,19 +148,45 @@ def cycle(
     if state.in_window and not inside:
         notify(summary_message(stats(journal.entries()), f"{now.astimezone(smc.NEW_YORK):%a %d %b}"))
     state.in_window = inside
-    if not inside:
-        return report
+    if inside:
+        _scan_and_review(now, report, journal=journal, scan_fn=scan_fn, review_fn=review_fn,
+                         notify=notify, state=state, max_agent_runs=max_agent_runs, candles=candles)
+    _ward_check(now, report, journal=journal, ward_fn=ward_fn, ward_every=ward_every,
+                notify=notify, state=state, candles=candles)
+    return report
 
+
+def _ward_check(now, report: Cycle, *, journal: Journal, ward_fn, ward_every, notify, state,
+                candles=None) -> None:
+    if ward_fn is None or not journal.entries(ACTIVE):
+        return
+    if state.last_ward is not None and now - state.last_ward < ward_every:
+        return
+    state.last_ward = now                       # also on failure: retry next interval, not next cycle
+    try:
+        review = ward_fn(now)
+    except Exception as exc:
+        report.notes.append(f"trade manager check failed: {exc}")
+        return
+    if review is None:
+        return
+    report.ward_checked = True
+    _, applied = file_review(review, journal, now=now, notify=notify, candles=candles)
+    report.notes += [a.text for a in applied if not a.ok]
+
+
+def _scan_and_review(now, report: Cycle, *, journal, scan_fn, review_fn, notify, state, max_agent_runs,
+                     candles=None) -> None:
     try:
         result = scan_fn(now)
     except Exception as exc:
         report.notes.append(f"scan failed: {exc}")
-        return report
+        return
     keys = {setup_key(s) for s in result.setups}
     fresh = keys - state.seen
     report.candidates, report.new_setups = len(result.setups), len(fresh)
     if not fresh:
-        return report
+        return
     if state.agent_runs >= max_agent_runs:
         if not state.cap_warned:
             notify(f"<b>FX desk</b>\nDaily agent-review limit ({max_agent_runs}) reached; "
@@ -147,20 +194,22 @@ def cycle(
             state.cap_warned = True
         state.seen |= keys
         report.notes.append("agent-review limit reached")
-        return report
+        return
 
     try:
         review, report_path = review_fn(result, now)
     except Exception as exc:
         report.notes.append(f"agent review failed: {exc}")
-        return report
+        return
     state.agent_runs += 1
     state.seen |= keys
     report.reviewed = True
     if review is None:
-        return report
-    report.new_orders, applied = file_review(review, journal, now=now, report=report_path, notify=notify)
+        return
+    if getattr(review, "positions", None):      # the trade manager took part in this review
+        state.last_ward = now
+    report.new_orders, applied = file_review(review, journal, now=now, report=report_path, notify=notify,
+                                             candles=candles)
     report.notes += [a.text for a in applied if not a.ok]
     for entry in report.new_orders:
         notify(order_message(entry))
-    return report

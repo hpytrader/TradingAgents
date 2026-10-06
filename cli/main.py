@@ -256,9 +256,11 @@ def fx_scan(
     if review is not None and review.messages:
         from datetime import UTC, datetime
 
+        from tradingagents.dataflows.vendors import oanda
         from tradingagents.fx.watch import file_review
 
-        added, applied = file_review(review, _fx_journal(), now=datetime.now(UTC), report=str(md or ""))
+        added, applied = file_review(review, _fx_journal(), now=datetime.now(UTC), report=str(md or ""),
+                                     candles=oanda.get_candles)
         for a in applied:
             console.print(("[green]✓[/green] " if a.ok else "[yellow]✕[/yellow] ") + a.text)
         if review.orders:
@@ -400,6 +402,9 @@ def fx_telegram():
 def fx_watch(
     interval: int = typer.Option(10, "--interval", help="Minutes between scans inside the window"),
     max_agent_runs: int = typer.Option(12, "--max-agent-runs", help="Most agent reviews per trading day (cost cap)"),
+    ward_every: int = typer.Option(
+        30, "--ward-every", help="Minutes between the trade manager's own checks of open and pending trades (0 = only in reviews)"
+    ),
     final: int = typer.Option(6, "--final", help="The most orders in a review's final book"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     max_per_currency: int = typer.Option(2, "--max-per-currency", help="Most orders long, or short, one currency"),
@@ -425,8 +430,8 @@ def fx_watch(
     except ValueError as exc:
         console.print(f"[red]--window: {exc}[/red]")
         raise typer.Exit(code=1) from None
-    if interval < 1 or max_agent_runs < 0 or final < 1 or max_per_currency < 1:
-        console.print("[red]--interval and --final must be at least 1; --max-agent-runs at least 0.[/red]")
+    if interval < 1 or max_agent_runs < 0 or final < 1 or max_per_currency < 1 or ward_every < 0:
+        console.print("[red]--interval and --final must be at least 1; --max-agent-runs and --ward-every at least 0.[/red]")
         raise typer.Exit(code=1)
     names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
     _require_oanda(names[0])
@@ -445,13 +450,19 @@ def fx_watch(
         return scan_smc(oanda.get_candles, oanda.get_quote, names, min_rr=min_rr, top=final + 4,
                         max_per_currency=max_per_currency + 1, window=scan_window, now=now)
 
-    review_fn = _fx_reviewer(final=final, max_per_currency=max_per_currency, min_rr=min_rr)
+    models: dict = {}
+    review_fn = _fx_reviewer(final=final, max_per_currency=max_per_currency, min_rr=min_rr, models=models)
+    ward_fn = _fx_ward(models) if ward_every else None
     book = _fx_journal()
     state = WatchState()
     page = _fx_dashboard_path()
 
     console.print(f"[bold]FX watcher[/bold] · window {scan_window.label()} · every {interval} min · "
                   f"up to {max_agent_runs} agent reviews a day")
+    from tradingagents.fx.team import team
+    ward_name = team()["trade_manager"].name
+    console.print(f"{ward_name} checks open and pending trades "
+                  + (f"every {ward_every} min, until they finish" if ward_every else "only during agent reviews"))
     console.print("Telegram alerts: " + ("[green]on[/green]" if alerts else
                   "[yellow]off[/yellow] (run `tradingagents fx-telegram` to set them up)"))
     console.print(f"Dashboard: {page}\n[dim]Keep this window open and the Mac awake "
@@ -465,13 +476,16 @@ def fx_watch(
         while True:
             now = datetime.now(UTC)
             c = cycle(now, window=scan_window, journal=book, candles=oanda.get_candles, scan_fn=scan_fn,
-                      review_fn=review_fn, notify=notify, state=state, max_agent_runs=max_agent_runs)
+                      review_fn=review_fn, notify=notify, state=state, max_agent_runs=max_agent_runs,
+                      ward_fn=ward_fn, ward_every=timedelta(minutes=ward_every or 30))
             stamp = now.astimezone(NEW_YORK).strftime("%H:%M")
             parts = [f"[dim]{stamp} NY[/dim]", "window open" if c.in_window else "window closed"]
             if c.in_window:
                 parts.append(f"{c.candidates} candidate(s), {c.new_setups} new")
                 if c.reviewed:
                     parts.append(f"agents reviewed → {len(c.new_orders)} new order(s)")
+            if c.ward_checked:
+                parts.append(f"{ward_name} checked the live trades")
             parts += c.notes
             console.print(" · ".join(parts))
             entries = book.entries()
@@ -503,20 +517,55 @@ def _fx_desk_inputs(setups, now):
     return tickets, positions
 
 
-def _fx_reviewer(*, final: int, max_per_currency: int, min_rr: float):
+def _fx_load_models(models: dict) -> dict:
+    """Build the quick and deep models once, on first use, and keep them in ``models``."""
+    if not models:
+        from tradingagents.llm_clients.factory import create_tier_client
+
+        _quiet_fx_logs()
+        models["quick"] = create_tier_client(DEFAULT_CONFIG, "quick").get_llm()
+        models["deep"] = create_tier_client(DEFAULT_CONFIG, "deep").get_llm()
+    return models
+
+
+def _fx_ward(models: dict):
+    """The trade manager's own check of the live book, for the watcher."""
+    from types import SimpleNamespace
+
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx import agents as fx_agents
+    from tradingagents.fx.context import gather
+    from tradingagents.fx.journal import ACTIVE, OPEN, day_close
+    from tradingagents.fx.manage import snapshot
+
+    def ward(now):
+        positions = snapshot(_fx_journal().entries(ACTIVE), oanda.get_candles, oanda.get_quote, now)
+        if not positions:
+            return None
+        _fx_load_models(models)
+        # Calendar and headlines up to when each trade can still be affected.
+        horizon = [SimpleNamespace(symbol=p.entry.symbol,
+                                   expires_at=day_close(p.entry.filled_at) if p.entry.status == OPEN
+                                   else p.entry.expires_at) for p in positions]
+        context = gather(horizon, now)
+        outcome = fx_agents.check_trades(positions, context, models["quick"], models["deep"], now=now)
+        for problem in outcome.problems:
+            console.print(f"[yellow]Model problem: {problem}[/yellow]")
+        return outcome
+
+    return ward
+
+
+def _fx_reviewer(*, final: int, max_per_currency: int, min_rr: float, models: dict | None = None):
     """A reviewer for the watcher: models built once, report saved, no exit on failure."""
     from tradingagents.fx import agents as fx_agents
     from tradingagents.fx.context import gather
     from tradingagents.fx.report import save as save_scan
-    from tradingagents.llm_clients.factory import create_tier_client
 
-    models = {}
+    models = {} if models is None else models
 
     def review(result, now):
-        if not models:
-            _quiet_fx_logs()
-            models["quick"] = create_tier_client(DEFAULT_CONFIG, "quick").get_llm()
-            models["deep"] = create_tier_client(DEFAULT_CONFIG, "deep").get_llm()
+        _fx_load_models(models)
         context = gather(result.setups, now)
         tickets, positions = _fx_desk_inputs(result.setups, now)
         outcome = fx_agents.review(result.setups, context, models["quick"], models["deep"],

@@ -374,6 +374,10 @@ def _chat(reviews: list[dict]) -> str:
     for i, r in enumerate(reviews):
         at = datetime.fromisoformat(r["at"])
         label = f"{r['orders']} order{'s' if r['orders'] != 1 else ''}" if r["orders"] else "no orders"
+        if r["messages"] and all(m.get("agent") in ("desk", "trade_manager") for m in r["messages"]):
+            ward = next((m["name"] for m in r["messages"] if m.get("agent") == "trade_manager"), "Trade manager")
+            changed = [m for m in r["messages"] if m.get("title") == "Trade changes"]
+            label = f"{ward} check" + (" · changes" if changed else " · held")
         buttons.append(f'<button type="button" data-review="{escape(r["id"], quote=True)}" '
                        f'aria-pressed="{"true" if i == 0 else "false"}"><b>{_ny(at)}</b>{escape(label)}</button>')
     return head + (f'<div class="chat"><div class="sessions" role="list">{"".join(buttons)}</div>'
