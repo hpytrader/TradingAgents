@@ -249,9 +249,265 @@ def fx_scan(
     elif review is None and result.setups:
         console.print(f"\n[dim]{DISCLAIMER}[/dim]")
 
+    md = None
     if save:
         md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], review)
         console.print(f"Saved: {md}")
+    if review is not None and review.orders:
+        from datetime import UTC, datetime
+
+        added = _fx_journal().record(review.orders, now=datetime.now(UTC), report=str(md or ""))
+        repeat = len(review.orders) - len(added)
+        console.print(f"Journal: {len(added)} order(s) added"
+                      + (f", {repeat} already pending or open" if repeat else "")
+                      + ". See them with: tradingagents fx-journal --open")
+
+
+def _fx_journal():
+    from pathlib import Path
+
+    from tradingagents.fx.journal import Journal
+
+    return Journal(Path(DEFAULT_CONFIG["results_dir"]) / "fx_journal.db")
+
+
+def _fx_dashboard_path():
+    from pathlib import Path
+
+    return Path(DEFAULT_CONFIG["results_dir"]) / "fx_dashboard.html"
+
+
+def _plain(html_text: str) -> str:
+    import re
+    from html import unescape
+
+    return unescape(re.sub(r"<[^>]+>", "", html_text))
+
+
+def _require_oanda(symbol: str):
+    from tradingagents.dataflows.errors import VendorNotConfiguredError
+    from tradingagents.dataflows.vendors import oanda
+
+    try:
+        oanda.get_quote(symbol)
+    except VendorNotConfiguredError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+    except Exception:
+        pass
+
+
+@app.command("fx-journal")
+def fx_journal(
+    settle: bool = typer.Option(True, "--settle/--no-settle", help="Replay OANDA prices to update open orders first"),
+    open_page: bool = typer.Option(False, "--open", help="Open the dashboard in your browser"),
+    limit: int = typer.Option(15, "--limit", help="How many recent orders to list"),
+    import_reports: bool = typer.Option(
+        False, "--import-reports", help="Add final orders from earlier saved agent reports (before the journal existed)"
+    ),
+):
+    """The paper-trade journal of the agents' final orders: results, scorecard and dashboard."""
+    import webbrowser
+    from datetime import UTC, datetime
+
+    from rich.table import Table
+
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx import dashboard
+    from tradingagents.fx.journal import stats
+    from tradingagents.fx.telegram import result_message
+
+    book = _fx_journal()
+    now = datetime.now(UTC)
+    if import_reports:
+        from pathlib import Path
+
+        folder = Path(DEFAULT_CONFIG["results_dir"]) / "fx_scans"
+        added = [e for path in sorted(folder.glob("*_agents.json")) for e in book.import_report(path)]
+        console.print(f"Imported {len(added)} order(s) from saved agent reports"
+                      + (": " + ", ".join(f"{e.symbol} ({e.created_at:%d %b %H:%M} UTC)" for e in added)
+                         if added else "."))
+    if settle and book.entries(("pending", "open")):
+        _require_oanda("EURUSD")
+        with console.status("Replaying prices for pending and open orders..."):
+            changes = book.settle(oanda.get_candles, now)
+        for change in changes:
+            console.print(_plain(result_message(change.entry)))
+
+    entries = book.entries()
+    s = stats(entries)
+    if not entries:
+        console.print("[yellow]The journal is empty. Orders are added by "
+                      "`tradingagents fx-scan --agents` and `tradingagents fx-watch`.[/yellow]")
+    else:
+        table = Table(title=f"FX journal: {s.total} orders")
+        for col in ("Suggested (NY)", "Symbol", "Order", "Entry", "Stop", "Target", "Status", "Result"):
+            table.add_column(col, justify="right" if col in ("Entry", "Stop", "Target", "Result") else "left")
+        from tradingagents.fx.smc import NEW_YORK
+        for e in sorted(entries, key=lambda e: e.created_at, reverse=True)[:limit]:
+            colour = {"won": "green", "lost": "red"}.get(e.status, "white")
+            table.add_row(e.created_at.astimezone(NEW_YORK).strftime("%a %d %b %H:%M"), e.symbol, e.order_type,
+                          str(e.entry), str(e.stop), str(e.target), f"[{colour}]{e.status}[/{colour}]",
+                          "—" if e.result_r is None else f"{e.result_r:+.2f}R")
+        console.print(table)
+        if s.finished:
+            console.print(f"Filled {s.finished}: win rate {s.win_rate:.0%} · total {s.total_r:+.2f}R · "
+                          f"expectancy {s.avg_r:+.2f}R · max drawdown {s.max_drawdown_r:.2f}R")
+        console.print(f"Open {s.open} · pending {s.pending} · expired {s.expired} · missed {s.missed}")
+        if s.finished < 30:
+            console.print("[dim]Fewer than 30 finished trades: too few to judge the win rate yet.[/dim]")
+    path = dashboard.write(_fx_dashboard_path(), entries, s, now=now)
+    console.print(f"Dashboard: {path}")
+    if open_page:
+        webbrowser.open(path.as_uri())
+
+
+@app.command("fx-telegram")
+def fx_telegram():
+    """Set up and test Telegram alerts (finds your chat id, then sends a test message)."""
+    from tradingagents.fx import telegram
+
+    if not telegram._token():
+        console.print(
+            "1. In Telegram, message [bold]@BotFather[/bold], send /newbot and follow the prompts.\n"
+            "2. Copy the token it gives you into .env as [bold]TELEGRAM_BOT_TOKEN=...[/bold]\n"
+            "3. Send your new bot any message, then run this command again.")
+        raise typer.Exit(code=1)
+    try:
+        if not telegram.chat_id():
+            chats = telegram.find_chats()
+            if not chats:
+                console.print("[yellow]The bot has no messages yet. Send it any message in Telegram, "
+                              "then run this again.[/yellow]")
+                raise typer.Exit(code=1)
+            console.print("Add this line to .env, then run this command again to send a test message:")
+            for chat, name in chats:
+                console.print(f"  [bold]TELEGRAM_CHAT_ID={chat}[/bold]   ({name})")
+            return
+        telegram.send("<b>FX desk</b>\nTelegram alerts are working. New orders and their results will arrive here.")
+    except telegram.TelegramError as exc:
+        console.print(f"[red]Telegram: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+    console.print("[green]Test message sent. Check Telegram.[/green]")
+
+
+@app.command("fx-watch")
+def fx_watch(
+    interval: int = typer.Option(10, "--interval", help="Minutes between scans inside the window"),
+    max_agent_runs: int = typer.Option(12, "--max-agent-runs", help="Most agent reviews per trading day (cost cap)"),
+    final: int = typer.Option(6, "--final", help="The most orders in a review's final book"),
+    min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
+    max_per_currency: int = typer.Option(2, "--max-per-currency", help="Most orders long, or short, one currency"),
+    window: str = typer.Option("02:00-12:00", "--window", help="Hours to build setups in, New York (= Toronto) time"),
+    symbols: str = typer.Option(None, "--symbols", help="Comma-separated pairs; omit for the default list"),
+    open_page: bool = typer.Option(False, "--open", help="Open the dashboard in your browser at the start"),
+):
+    """Watch the market all morning: scan every few minutes, review new setups with the agents,
+    journal the orders, settle them, and send alerts to Telegram."""
+    import time as clock
+    import webbrowser
+    from datetime import UTC, datetime, timedelta
+
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx import DEFAULT_UNIVERSE, dashboard, telegram
+    from tradingagents.fx.journal import stats
+    from tradingagents.fx.smc import NEW_YORK
+    from tradingagents.fx.smc_scanner import ScanWindow, scan_smc
+    from tradingagents.fx.watch import WatchState, cycle
+
+    try:
+        scan_window = ScanWindow.parse(window)
+    except ValueError as exc:
+        console.print(f"[red]--window: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+    if interval < 1 or max_agent_runs < 0 or final < 1 or max_per_currency < 1:
+        console.print("[red]--interval and --final must be at least 1; --max-agent-runs at least 0.[/red]")
+        raise typer.Exit(code=1)
+    names = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
+    _require_oanda(names[0])
+
+    alerts = telegram.configured()
+
+    def notify(text: str):
+        console.print(_plain(text))
+        if alerts:
+            try:
+                telegram.send(text)
+            except telegram.TelegramError as exc:
+                console.print(f"[yellow]Telegram: {exc}[/yellow]")
+
+    def scan_fn(now):
+        return scan_smc(oanda.get_candles, oanda.get_quote, names, min_rr=min_rr, top=final + 4,
+                        max_per_currency=max_per_currency + 1, window=scan_window, now=now)
+
+    review_fn = _fx_reviewer(final=final, max_per_currency=max_per_currency, min_rr=min_rr)
+    book = _fx_journal()
+    state = WatchState()
+    page = _fx_dashboard_path()
+
+    console.print(f"[bold]FX watcher[/bold] · window {scan_window.label()} · every {interval} min · "
+                  f"up to {max_agent_runs} agent reviews a day")
+    console.print("Telegram alerts: " + ("[green]on[/green]" if alerts else
+                  "[yellow]off[/yellow] (run `tradingagents fx-telegram` to set them up)"))
+    console.print(f"Dashboard: {page}\n[dim]Keep this window open and the Mac awake "
+                  "(start it with `caffeinate -i tradingagents fx-watch`). Ctrl+C stops it.[/dim]\n")
+    dashboard.write(page, book.entries(), stats(book.entries()), live=True, window=scan_window)
+    if open_page:
+        webbrowser.open(page.as_uri())
+
+    try:
+        while True:
+            now = datetime.now(UTC)
+            c = cycle(now, window=scan_window, journal=book, candles=oanda.get_candles, scan_fn=scan_fn,
+                      review_fn=review_fn, notify=notify, state=state, max_agent_runs=max_agent_runs)
+            stamp = now.astimezone(NEW_YORK).strftime("%H:%M")
+            parts = [f"[dim]{stamp} NY[/dim]", "window open" if c.in_window else "window closed"]
+            if c.in_window:
+                parts.append(f"{c.candidates} candidate(s), {c.new_setups} new")
+                if c.reviewed:
+                    parts.append(f"agents reviewed → {len(c.new_orders)} new order(s)")
+            parts += c.notes
+            console.print(" · ".join(parts))
+            entries = book.entries()
+            dashboard.write(page, entries, stats(entries), now=now, live=True, window=scan_window,
+                            last_cycle=f"{stamp} NY")
+
+            if c.in_window:
+                wait = timedelta(minutes=interval)
+            elif any(e.status in ("pending", "open") for e in entries):
+                wait = timedelta(minutes=15)          # keep settling open trades until the close
+            else:
+                wait = min(scan_window.next_open(now) - now, timedelta(hours=1))
+            clock.sleep(max(wait.total_seconds(), 30))
+    except KeyboardInterrupt:
+        entries = book.entries()
+        dashboard.write(page, entries, stats(entries), window=scan_window)
+        console.print("\nWatcher stopped.")
+
+
+def _fx_reviewer(*, final: int, max_per_currency: int, min_rr: float):
+    """A reviewer for the watcher: models built once, report saved, no exit on failure."""
+    from tradingagents.fx import agents as fx_agents
+    from tradingagents.fx.context import gather
+    from tradingagents.fx.report import save as save_scan
+    from tradingagents.llm_clients.factory import create_tier_client
+
+    models = {}
+
+    def review(result, now):
+        if not models:
+            _quiet_fx_logs()
+            models["quick"] = create_tier_client(DEFAULT_CONFIG, "quick").get_llm()
+            models["deep"] = create_tier_client(DEFAULT_CONFIG, "deep").get_llm()
+        context = gather(result.setups, now)
+        outcome = fx_agents.review(result.setups, context, models["quick"], models["deep"],
+                                   max_orders=final, max_per_currency=max_per_currency, min_rr=min_rr, now=now)
+        for problem in outcome.problems:
+            console.print(f"[yellow]Model problem: {problem}[/yellow]")
+        md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], outcome)
+        return outcome, str(md)
+
+    return review
 
 
 def _print_scan(result, quiet: bool = False):

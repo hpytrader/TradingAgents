@@ -404,6 +404,24 @@ The final orders are then checked in code against the scanner's facts: the right
 
 The review uses the provider and models set in `.env` (`TRADINGAGENTS_LLM_PROVIDER` and the quick and deep models). Headlines come from FXStreet's public news feed (Yahoo Finance when it cannot be read), matched to each pair by currency, central bank and nickname. The economic calendar is the Forex Factory weekly feed, cached for an hour; it carries forecasts but not actual results, and when it cannot be read the agents are told event risk is unknown rather than absent.
 
+### Journal, dashboard and the watcher
+
+Every final order from `fx-scan --agents` is written to a paper-trade journal (`<results_dir>/fx_journal.db`). Nothing is sent to a broker: the journal replays OANDA's one-minute prices after each order was suggested and records what the limit order would have done.
+
+- **Filled** when price touches the entry; **missed** if the target trades first (the move happened without the order); **expired** if the cancel time passes first.
+- Once filled, **won** at the target, **lost** at the stop (a minute that touches both counts as the stop), or **closed** at the New York 17:00 close.
+- Results are in R, net of the spread recorded at the scan.
+
+```bash
+tradingagents fx-journal --open      # settle, print the scorecard, open the dashboard
+tradingagents fx-telegram            # set up Telegram alerts (finds your chat id, sends a test)
+caffeinate -i tradingagents fx-watch --open    # run all morning
+```
+
+`fx-journal` writes `<results_dir>/fx_dashboard.html`: a self-contained page with the win rate, total and average R, profit factor, drawdown and fill rate, the cumulative-R curve, live orders, results by symbol and conviction, and every order with the agents' reasoning. It loads nothing from the network.
+
+`fx-watch` runs one cycle every ten minutes (`--interval`). Each cycle settles the journal and reports changes; inside the window it runs the free scanner and calls the agents only when a setup appears that it has not seen earlier in the trading day, at most twelve reviews a day (`--max-agent-runs`). New orders and results go to Telegram when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, and a summary is sent when the window closes. Outside the window it keeps settling open trades until the close, and the dashboard refreshes itself every minute while the watcher runs. The Mac must stay awake: `caffeinate -i` prevents idle sleep, but closing the lid still sleeps a laptop.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.
