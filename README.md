@@ -398,6 +398,10 @@ Both strategies hold at most two trades long or short the same currency (`--max-
 6. **Aggressive, neutral and conservative risk analysts** review the book as a whole: shared currencies, correlated pairs, orders that could fill into the same release.
 7. **Portfolio manager** (deep model) chooses the final book and each order's cancel time.
 
+The agents argue with each other rather than in isolation: the bear (Ursa) answers the bull's (Leo's) case point by point, the conservative risk analyst (Haven) answers the aggressive one (Blaze), and the neutral one (Pivot) weighs both. Each has a name, a role and a bio, shown as team cards at the foot of the dashboard: Atlas (macro), Vega (price action), Leo and Ursa (bull and bear), Sage (research manager), Nova (trader), Blaze, Haven and Pivot (risk) and Orion (portfolio manager). Rename any of them in `~/.tradingagents/fx_team.json`, e.g. `{"macro": {"name": "Jarvis"}}`.
+
+Every review is saved as a conversation: the desk's scan, each agent's message in order, the decisions and the final verification. The dashboard's **desk chat** lists the sessions and shows each one as a chat, and every journal order links to the conversation that produced it.
+
 Every agent sees all candidates at once, so a review is ten model calls whatever the number of candidates. If the deep model fails (a spent free quota, say), the two managers fall back to the quick model before any rule-based fallback, and every failure is reported in one line.
 
 The final orders are then checked in code against the scanner's facts: the right side of price, the minimum RR after the spread and the per-currency cap; for SMC setups an entry inside the order block / FVG, a stop beyond the sweep and a cancel time no later than the scanner's; for trend setups an entry within 1.5 ATR of the scanner's level and a stop at least 0.5 ATR away. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.

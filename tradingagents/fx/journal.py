@@ -46,6 +46,7 @@ COLUMNS = (
     "id", "created_at", "symbol", "direction", "entry", "stop", "target", "planned_rr",
     "spread", "expires_at", "conviction", "rationale", "watch_for", "strategy", "scanner_score",
     "report", "status", "filled_at", "exit_at", "exit_price", "result_r", "note", "notified",
+    "review_id",
 )
 
 SCHEMA = """
@@ -72,7 +73,18 @@ CREATE TABLE IF NOT EXISTS orders (
     exit_price REAL,
     result_r REAL,
     note TEXT,
-    notified TEXT
+    notified TEXT,
+    review_id TEXT
+)
+"""
+
+REVIEWS = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    summary TEXT,
+    orders INTEGER DEFAULT 0,
+    messages TEXT NOT NULL
 )
 """
 
@@ -104,6 +116,7 @@ class Entry:
     result_r: float | None = None
     note: str = ""
     notified: str = ""
+    review_id: str = ""
 
     @property
     def long(self) -> bool:
@@ -141,6 +154,10 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as db, db:
             db.execute(SCHEMA)
+            db.execute(REVIEWS)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(orders)")}
+            if "review_id" not in columns:          # journals from before the desk chat
+                db.execute("ALTER TABLE orders ADD COLUMN review_id TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
@@ -167,11 +184,35 @@ class Journal:
         data["spread"] = data["spread"] or 0.0
         data["notified"] = data["notified"] or ""
         data["note"] = data["note"] or ""
+        data["review_id"] = data.get("review_id") or ""
         return Entry(**data)
 
     # -- writing --------------------------------------------------------------
 
-    def record(self, orders: Iterable, *, now: datetime, report: str = "") -> list[Entry]:
+    def record_review(self, review, *, now: datetime) -> str:
+        """Save a review's conversation; returns its id (empty when it has no messages)."""
+        import json
+
+        messages = getattr(review, "messages", None) or []
+        if not messages:
+            return ""
+        rid = f"{now:%Y%m%d-%H%M%S}"
+        with closing(self._connect()) as db, db:
+            db.execute("INSERT OR REPLACE INTO reviews (id, at, summary, orders, messages) VALUES (?,?,?,?,?)",
+                       (rid, _iso(now), getattr(review, "summary", ""), len(getattr(review, "orders", []) or []),
+                        json.dumps(messages)))
+        return rid
+
+    def reviews(self, limit: int = 30) -> list[dict]:
+        """The latest saved conversations, newest first."""
+        import json
+
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT * FROM reviews ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r["id"], "at": r["at"], "summary": r["summary"] or "", "orders": r["orders"],
+                 "messages": json.loads(r["messages"])} for r in rows]
+
+    def record(self, orders: Iterable, *, now: datetime, report: str = "", review_id: str = "") -> list[Entry]:
         """Add the review's final orders; returns the ones that are new.
 
         A suggestion repeating an order already pending or open for the same
@@ -191,6 +232,7 @@ class Journal:
                     spread=o.setup.spread_pips * spec.pip, expires_at=o.expires_at,
                     conviction=o.conviction, rationale=o.rationale, watch_for=o.watch_for,
                     strategy=o.setup.strategy, scanner_score=o.setup.score, report=report,
+                    review_id=review_id,
                 )
                 db.execute(
                     f"INSERT OR IGNORE INTO orders ({','.join(COLUMNS)}) VALUES ({','.join('?' * len(COLUMNS))})",
@@ -233,7 +275,7 @@ class Journal:
         return (e.id, _iso(e.created_at), e.symbol, e.direction, e.entry, e.stop, e.target,
                 e.planned_rr, e.spread, _iso(e.expires_at), e.conviction, e.rationale,
                 e.watch_for, e.strategy, e.scanner_score, e.report, e.status, _iso(e.filled_at),
-                _iso(e.exit_at), e.exit_price, e.result_r, e.note, e.notified)
+                _iso(e.exit_at), e.exit_price, e.result_r, e.note, e.notified, e.review_id)
 
     def save(self, e: Entry) -> None:
         with closing(self._connect()) as db, db:

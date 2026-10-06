@@ -253,10 +253,16 @@ def fx_scan(
     if save:
         md, _ = save_scan(result, DEFAULT_CONFIG["results_dir"], review)
         console.print(f"Saved: {md}")
-    if review is not None and review.orders:
+    if review is not None:
         from datetime import UTC, datetime
 
-        added = _fx_journal().record(review.orders, now=datetime.now(UTC), report=str(md or ""))
+        book = _fx_journal()
+        stamp = datetime.now(UTC)
+        review_id = book.record_review(review, now=stamp)
+        if review_id:
+            console.print("Desk chat saved: see it with tradingagents fx-journal --open")
+    if review is not None and review.orders:
+        added = book.record(review.orders, now=stamp, report=str(md or ""), review_id=review_id)
         repeat = len(review.orders) - len(added)
         console.print(f"Journal: {len(added)} order(s) added"
                       + (f", {repeat} already pending or open" if repeat else "")
@@ -356,7 +362,7 @@ def fx_journal(
         console.print(f"Open {s.open} · pending {s.pending} · expired {s.expired} · missed {s.missed}")
         if s.finished < 30:
             console.print("[dim]Fewer than 30 finished trades: too few to judge the win rate yet.[/dim]")
-    path = dashboard.write(_fx_dashboard_path(), entries, s, now=now)
+    path = dashboard.write(_fx_dashboard_path(), entries, s, now=now, reviews=book.reviews())
     console.print(f"Dashboard: {path}")
     if open_page:
         webbrowser.open(path.as_uri())
@@ -451,7 +457,8 @@ def fx_watch(
                   "[yellow]off[/yellow] (run `tradingagents fx-telegram` to set them up)"))
     console.print(f"Dashboard: {page}\n[dim]Keep this window open and the Mac awake "
                   "(start it with `caffeinate -i tradingagents fx-watch`). Ctrl+C stops it.[/dim]\n")
-    dashboard.write(page, book.entries(), stats(book.entries()), live=True, window=scan_window)
+    dashboard.write(page, book.entries(), stats(book.entries()), live=True, window=scan_window,
+                    reviews=book.reviews())
     if open_page:
         webbrowser.open(page.as_uri())
 
@@ -470,7 +477,7 @@ def fx_watch(
             console.print(" · ".join(parts))
             entries = book.entries()
             dashboard.write(page, entries, stats(entries), now=now, live=True, window=scan_window,
-                            last_cycle=f"{stamp} NY")
+                            last_cycle=f"{stamp} NY", reviews=book.reviews())
 
             if c.in_window:
                 wait = timedelta(minutes=interval)
@@ -481,7 +488,7 @@ def fx_watch(
             clock.sleep(max(wait.total_seconds(), 30))
     except KeyboardInterrupt:
         entries = book.entries()
-        dashboard.write(page, entries, stats(entries), window=scan_window)
+        dashboard.write(page, entries, stats(entries), window=scan_window, reviews=book.reviews())
         console.print("\nWatcher stopped.")
 
 
