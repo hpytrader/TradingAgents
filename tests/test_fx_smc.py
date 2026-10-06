@@ -320,15 +320,25 @@ def test_outside_the_window_nothing_is_built_unless_asked():
 
 
 @pytest.mark.unit
-def test_an_order_is_cancelled_when_the_window_closes():
+def test_an_order_outlives_the_scan_window_until_the_latest_cancel_time():
+    # 2026-10-06 11:37 New York: a setup found 23 minutes before the noon
+    # close of the window got 23 minutes to fill. It now keeps its 4 hours,
+    # up to 14:00 New York.
+    from tradingagents.fx.smc_scanner import cancel_deadline
+
+    late = _ny(2026, 10, 6, 11, 37)
+    assert cancel_deadline(late) == _ny(2026, 10, 6, 14, 0)
+    assert cancel_deadline(_ny(2026, 10, 6, 15, 0)) == _ny(2026, 10, 7, 14, 0)        # next day's 14:00
+    assert cancel_deadline(_ny(2026, 10, 9, 11, 0)) == _ny(2026, 10, 9, 14, 0)
+    assert cancel_deadline(_ny(2026, 10, 9, 15, 0)) == _ny(2026, 10, 9, 17, 0)        # never past Friday's close
+
     candles, quote = _fetchers(_m5(), _h1())
-    late = scan_smc(candles, quote, ["EURUSD"], window=ScanWindow.parse("02:00-05:00"), now=NOW)
-    assert late.setups[0].expires_at == _ny(2026, 10, 6, 5)
+    early = scan_smc(candles, quote, ["EURUSD"], now=NOW).setups[0]                   # 04:30 New York
+    assert early.expires_at == NOW + timedelta(hours=4)                               # 08:30, under 14:00
+    from datetime import time as clock
+    capped = scan_smc(candles, quote, ["EURUSD"], now=NOW, latest_cancel=clock(6, 0)).setups[0]
+    assert capped.expires_at == _ny(2026, 10, 6, 6, 0)
 
-
-# ---------------------------------------------------------------------------
-# Verification of SMC orders
-# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_smc_orders_must_stay_in_the_zone_and_behind_the_sweep():

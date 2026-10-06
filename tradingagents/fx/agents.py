@@ -36,10 +36,10 @@ Progress = Callable[[str], None]
 
 GROUND_RULES = f"""You work on an intraday forex and metals desk. {NO_EXTERNAL_TOOLS}
 Desk rules: every order is a limit order. An unfilled order is cancelled at its listed cancel \
-time (no later than the end of the morning scan window, 12:00 New York by default) or \
-earlier for a release. A filled trade is \
-managed only by its stop and target and is closed at the New York 17:00 close (21:00 UTC in \
-summer, 22:00 UTC in winter) at the latest; nothing is held overnight.
+time (14:00 New York at the latest) or earlier for a release. A filled trade runs on its stop and \
+target; only the trade manager may change it (tighten the stop, move the target, close it early) \
+and it is closed at the New York 17:00 close (21:00 UTC in summer, 22:00 UTC in winter) at the \
+latest; nothing is held overnight.
 A release after today's New York close cannot affect any of today's orders or trades: when a \
 headline mentions an event, find its time in the calendar before treating it as a risk.
 Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
@@ -607,6 +607,11 @@ def review(
     orders += [{"symbol": s.symbol, "entry": s.entry, "stop": s.stop, "target": s.target,
                 "note": "scanner levels"} for s in kept if s.symbol not in written]
     plan_text = _render_plan(orders, by_symbol)
+    if dropped:
+        # The risk team and the portfolio manager judge only the trader's book;
+        # without this they spend their answers on setups that are already out.
+        plan_text += ("\n\nAlready dropped by the research manager (not orders; do not review them): "
+                      + ", ".join(f"{ctx.tickets.get(sym, '')} {sym}".strip() for sym, _ in dropped))
     transcript["Trader"] = plan_text
     post("trader", "Orders", plan_text, "decision")
 

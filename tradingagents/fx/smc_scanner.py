@@ -101,6 +101,18 @@ class ScanWindow:
         raise RuntimeError("no window opens in the next week")  # pragma: no cover
 
 
+LATEST_CANCEL = time(14, 0)
+
+
+def cancel_deadline(now: datetime, latest: time = LATEST_CANCEL) -> datetime:
+    """The next ``latest`` on New York clocks, and never past the Friday 17:00 close (UTC)."""
+    local = now.astimezone(smc.NEW_YORK)
+    deadline = smc.NEW_YORK.localize(datetime.combine(local.date(), latest))
+    if deadline <= local:
+        deadline = smc.NEW_YORK.localize(datetime.combine(local.date() + timedelta(days=1), latest))
+    return min(deadline, _weekend_starts(local)).astimezone(UTC)
+
+
 def market_open(now: datetime) -> bool:
     """Whether spot forex trades at ``now``: shut Friday 17:00 to Sunday 17:00 New York."""
     local = now.astimezone(smc.NEW_YORK)
@@ -157,12 +169,16 @@ def scan_smc(
     valid_hours: float = 4.0,
     window: ScanWindow | None = None,
     any_session: bool = False,
+    latest_cancel: time = LATEST_CANCEL,
     now: datetime | None = None,
 ) -> ScanResult:
     """Scan ``symbols`` for SMC setups and return the best per instrument, ranked.
 
-    An unfilled order is cancelled after ``valid_hours`` or at the window's
-    close, whichever comes first.
+    The window decides when to look; an order found in it keeps ``valid_hours``
+    to fill, but is cancelled by ``latest_cancel`` New York time at the latest
+    (14:00 by default, leaving a fill three hours before the 17:00 close) and
+    never past the weekend close. A setup found at 11:40 therefore gets until
+    14:00, not 20 minutes.
     """
     now = now or datetime.now(UTC)
     window = window or ScanWindow()
@@ -170,7 +186,7 @@ def scan_smc(
     if closes is None and not any_session:
         return ScanResult(scanned_at=now, setups=[], skipped=[("ALL", outside_window_reason(window, now))],
                           ran=False)
-    expires = min(closes or now + timedelta(hours=valid_hours), now + timedelta(hours=valid_hours))
+    expires = min(now + timedelta(hours=valid_hours), cancel_deadline(now, latest_cancel))
     session_name = phase(now)
 
     best: list[Setup] = []
