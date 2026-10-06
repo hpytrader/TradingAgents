@@ -59,7 +59,7 @@ class Pool:
     name: str               # "previous day low", "Asian high", "equal lows", ...
     level: float
     side: str               # "low" (sell-side liquidity) or "high" (buy-side)
-    quality: int            # 3 previous day, 2 session range, 1 equal highs/lows
+    quality: int            # 3 previous day, 2 session range, 1 equal highs/lows, 0 swing point
     formed_i: int = 0       # first bar at which the pool exists; only later bars can sweep it
 
 
@@ -207,6 +207,14 @@ def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2) -> list
             formed = offset + pair[1].i + wing
             if all(abs(level - p.level) > tolerance for p in out if p.side == side):
                 out.append(Pool(name, level, side, 1, formed))
+
+    # Single swing points of the last twelve hours: the stops a swing failure
+    # pattern (SFP) runs. Only those not already covered by a stronger pool.
+    near = max(len(frame) - 144, 0)
+    for s in swings(frame.iloc[near:], wing):
+        side = s.kind
+        if all(abs(s.price - p.level) > tolerance for p in out if p.side == side):
+            out.append(Pool(f"swing {side}", s.price, side, 0, near + s.i + wing))
     return out
 
 
@@ -215,12 +223,17 @@ def sweeps(frame: pd.DataFrame, liquidity: list[Pool], side: str, since_i: int) 
     lows, highs, closes = (frame[c].to_numpy() for c in ("low", "high", "close"))
     out = []
     for pool in (p for p in liquidity if p.side == side):
-        for i in range(max(since_i, pool.formed_i + 1, 0), len(frame)):
+        for i in range(max(pool.formed_i + 1, 0), len(frame)):
             if side == "low" and lows[i] < pool.level < closes[i]:
-                out.append(Sweep(pool, i, float(lows[i])))
+                if i >= since_i:
+                    out.append(Sweep(pool, i, float(lows[i])))
                 break
             if side == "high" and highs[i] > pool.level > closes[i]:
-                out.append(Sweep(pool, i, float(highs[i])))
+                if i >= since_i:
+                    out.append(Sweep(pool, i, float(highs[i])))
+                break
+            # A close beyond the level broke it: there is no liquidity left to sweep.
+            if (side == "low" and closes[i] < pool.level) or (side == "high" and closes[i] > pool.level):
                 break
     return out
 

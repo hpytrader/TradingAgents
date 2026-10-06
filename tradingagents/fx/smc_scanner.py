@@ -40,6 +40,8 @@ SWEEP_LOOKBACK = 72        # M5 bars (6 hours) searched for a sweep
 CHOCH_WITHIN = 36          # M5 bars (3 hours) after the sweep for the shift to come
 MAX_TARGET_H1_ATR = 3.0    # beyond this an intraday target is a stretch
 MIN_RISK_H1_ATR = 0.35     # a stop closer than this (in 1-hour ATRs) is inside normal noise
+MAX_SHIFT_AGE = timedelta(hours=2)   # an older structure shift has usually played out
+MAX_ENTRY_H1_ATR = 2.0     # a limit farther than this from price is unlikely to fill this session
 STALE_AFTER = timedelta(minutes=30)
 
 
@@ -243,6 +245,11 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
                 atr5, atr1, min_rr, h1_break, now, expires, session_name) -> Setup | str:
     up = "up" if long else "down"
     sign = 1 if long else -1
+    age = now - m5.index[shift.i].to_pydatetime()
+    if age > MAX_SHIFT_AGE:
+        hours = age.total_seconds() / 3600
+        return (f"the structure shift at {m5.index[shift.i]:%H:%M} UTC is {hours:.1f}h old; "
+                "the move has most likely played out")
     ob = smc.order_block(m5, sweep.i, shift.i, up)
     gaps = smc.fair_value_gaps(m5, sweep.i, shift.i, up)
     # Zones in order of preference: a gap inside the order block, other gaps
@@ -269,6 +276,9 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         return f"every {kinds} from the move has already been traded back into"
 
     entry = zone.mid
+    if abs(mid - entry) > MAX_ENTRY_H1_ATR * atr1:
+        return (f"the {zone.kind} is {abs(mid - entry) / atr1:.1f}× the hourly range from price; "
+                "a limit there is unlikely to fill this session")
     buffer = max(3 * spread, 0.3 * atr5)
     stop = sweep.extreme - sign * buffer
     widened = False
@@ -280,7 +290,8 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         widened = True
     risk = abs(entry - stop)
 
-    target, target_name = _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5)
+    target, target_name = _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5,
+                                  after_i=shift.i)
     if target is None:
         return target_name
     reward = abs(target - entry)
@@ -321,8 +332,13 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
     )
 
 
-def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5):
-    """Nearest opposing liquidity beyond price paying ``min_rr``: (price, name) or (None, why)."""
+def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5, after_i=None):
+    """Nearest opposing liquidity beyond price paying ``min_rr``: (price, name) or (None, why).
+
+    Liquidity price has already traded through since the structure shift
+    (``after_i``) is spent: the move took it, so it is no target for an order
+    placed now, even when price has since pulled back below it.
+    """
     sign = 1 if long else -1
     side = "high" if long else "low"
     options = [(p.level, p.name) for p in liquidity if p.side == side]
@@ -334,6 +350,14 @@ def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr
             options.append((s.price, "1h swing high" if long else "1h swing low"))
     beyond = sorted(((lvl, name) for lvl, name in options if (lvl - mid) * sign > 0),
                     key=lambda x: (x[0] - mid) * sign)
+    if after_i is not None and beyond:
+        moved = m5.iloc[after_i:]
+        reach = float(moved["high"].max()) if long else float(moved["low"].min())
+        fresh = [(lvl, name) for lvl, name in beyond if (lvl - reach) * sign > 0]
+        if not fresh:
+            return None, (f"price already ran to {reach:g} after the shift, taking the "
+                          f"{beyond[0][1]}; the move has happened")
+        beyond = fresh
     if not beyond:
         return None, "no opposing liquidity left beyond price to target"
     limit = MAX_TARGET_H1_ATR * atr1
@@ -353,7 +377,7 @@ def _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth, 
            spread, atr5, target_name, long, m5):
     reasons = []
     when = m5.index[sweep.i].strftime("%H:%M")
-    pool_pts = {3: 25, 2: 20, 1: 15}[sweep.pool.quality]
+    pool_pts = {3: 25, 2: 20, 1: 15, 0: 10}[sweep.pool.quality]
     reasons.append(f"swept the {sweep.pool.name} ({spec.round_price(sweep.pool.level)}) at {when} UTC "
                    f"and closed back {'above' if long else 'below'}")
 

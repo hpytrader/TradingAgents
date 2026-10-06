@@ -34,7 +34,7 @@ def _wave(start_t, n, start, end, amp=0.0003):
     return rows
 
 
-def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729):
+def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729, spent=False):
     t = datetime(2026, 10, 4, 21, 0, tzinfo=UTC)          # previous trading day starts
     rows = []
     rows += _wave(t, 144, 1.1720, 1.1790)                   # Oct 5 to 09:00: up to the day high
@@ -67,7 +67,8 @@ def _m5(*, sweep=True, mitigate=False, mitigate_low=1.1729):
     for k in range(7):                                       # 07:55-08:25 holds above the gap
         p = 1.1743 + (0.0002 if k % 2 else -0.0001)
         low_k = mitigate_low if (mitigate and k == 3) else p - 0.0003
-        rows.append(_bar(t + timedelta(minutes=5 * k), p, p + 0.0003, low_k, p))
+        high_k = 1.1810 if (spent and k == 2) else p + 0.0003   # a run through every target, then back
+        rows.append(_bar(t + timedelta(minutes=5 * k), p, high_k, low_k, p))
     frame = pd.DataFrame(rows).set_index("time")
     frame.index = pd.DatetimeIndex(frame.index)
     return frame
@@ -407,3 +408,53 @@ def test_the_target_skips_a_pool_sitting_right_at_price():
                                        1.5 * atr5, 0.00005, 2.0, smc.atr(h1), atr5)
     assert name != "equal highs"
     assert target > mid
+
+
+@pytest.mark.unit
+def test_a_move_that_already_reached_its_targets_is_not_offered():
+    # The XAUUSD case from 2026-10-06: after the shift price ran through the
+    # nearby liquidity, then pulled back under it. The entry zone was never
+    # revisited, but the trade has already played out.
+    candles, quote = _fetchers(_m5(spent=True), _h1())
+    result = scan_smc(candles, quote, ["EURUSD"], now=NOW)
+    assert result.setups == []
+    assert "the move has happened" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_an_old_structure_shift_is_stale(monkeypatch):
+    import tradingagents.fx.smc_scanner as smc_scanner
+
+    monkeypatch.setattr(smc_scanner, "MAX_SHIFT_AGE", timedelta(minutes=20))   # the shift is 40 min old
+    candles, quote = _fetchers(_m5(), _h1())
+    result = scan_smc(candles, quote, ["EURUSD"], now=NOW)
+    assert result.setups == [] and "old; the move has most likely played out" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_an_entry_far_from_price_is_not_offered(monkeypatch):
+    import tradingagents.fx.smc_scanner as smc_scanner
+
+    monkeypatch.setattr(smc_scanner, "MAX_ENTRY_H1_ATR", 0.05)
+    candles, quote = _fetchers(_m5(), _h1())
+    result = scan_smc(candles, quote, ["EURUSD"], now=NOW)
+    assert result.setups == [] and "unlikely to fill this session" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_swing_points_are_liquidity_for_a_swing_failure():
+    m5 = _m5()
+    names = {p.name for p in smc.pools(m5, NOW, atr=smc.atr(m5))}
+    assert {"swing low", "swing high"} <= names
+
+
+@pytest.mark.unit
+def test_a_level_closed_through_cannot_be_swept_later():
+    from tradingagents.fx.smc import Pool
+
+    frame = pd.DataFrame({"open": [1.2, 1.1, 1.0], "high": [1.25, 1.15, 1.1],
+                          "low": [1.15, 0.9, 0.95], "close": [1.2, 0.92, 1.05]})
+    pool = Pool("swing low", 1.0, "low", 0, formed_i=0)
+    assert smc.sweeps(frame, [pool], "low", 0) == []                 # bar 1 closed below: broken
+    intact = Pool("swing low", 0.97, "low", 0, formed_i=1)
+    assert [s.i for s in smc.sweeps(frame, [intact], "low", 0)] == [2]
