@@ -194,13 +194,14 @@ def test_full_review_runs_every_role_once_and_verifies_the_book():
 
     result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
 
-    assert len(quick.prompts) == 7        # macro, bull, bear, trader, three risk analysts
+    assert len(quick.prompts) == 8        # macro, price action, bull, bear, trader, three risk
     assert len(deep.prompts) == 2         # research manager, portfolio manager
     assert [o.symbol for o in result.orders] == ["EURUSD", "USDJPY"]
     assert result.orders[0].entry == eur.entry            # reverted by verification
     assert "scanner levels used" in result.orders[0].notes[0]
     assert dict(result.dropped)["GBPUSD"].startswith("research manager")
-    assert set(result.transcript) >= {"Macro analyst", "Bull researcher", "Bear researcher",
+    assert set(result.transcript) >= {"Macro analyst", "Price-action analyst",
+                                      "Bull researcher", "Bear researcher",
                                       "Research manager", "Trader", "Portfolio manager",
                                       "Aggressive risk analyst", "Neutral risk analyst",
                                       "Conservative risk analyst"}
@@ -213,7 +214,7 @@ def test_dropping_everything_ends_the_review_early():
     quick, deep = _team(candidates, keep=[])
     result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
     assert result.orders == []
-    assert len(deep.prompts) == 1 and len(quick.prompts) == 3
+    assert len(deep.prompts) == 1 and len(quick.prompts) == 4
 
 
 @pytest.mark.unit
@@ -334,3 +335,85 @@ def test_agent_report_leads_with_the_final_orders(tmp_path):
     assert "no track record" in text
     data = json.loads(js.read_text(encoding="utf-8"))
     assert [o["symbol"] for o in data["review"]["orders"]] == ["EURUSD", "USDJPY"]
+
+
+QUOTA = RuntimeError("429 RESOURCE_EXHAUSTED. You exceeded your current quota "
+                     "{'error': {'code': 429, ... 'quotaValue': '20'}}")
+
+
+@pytest.mark.unit
+def test_the_fast_model_decides_when_the_strong_one_is_out_of_quota():
+    candidates = [_setup("EURUSD"), _setup("USDJPY", "short")]
+    quick, deep = _team(candidates)
+    quick.structured[ResearchVerdict] = deep.structured[ResearchVerdict]
+    quick.structured[FinalBook] = deep.structured[FinalBook]
+    deep.structured[ResearchVerdict] = QUOTA
+    deep.structured[FinalBook] = QUOTA
+
+    result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
+
+    assert [o.symbol for o in result.orders] == ["EURUSD", "USDJPY"]
+    assert all(o.conviction == "medium" for o in result.orders)       # a real decision
+    assert result.problems == ["Research manager: daily quota used up",
+                               "Portfolio manager: daily quota used up"]
+    assert all("decided by the fast model (strong model: daily quota used up)" in f
+               for f in result.fallbacks)
+    assert not any("no usable answer" in f for f in result.fallbacks)
+
+
+@pytest.mark.unit
+def test_a_failed_text_agent_does_not_stop_the_review():
+    candidates = [_setup("EURUSD")]
+    quick, deep = _team(candidates)
+    calls = {"n": 0}
+    original = quick.invoke
+
+    def flaky(prompt):
+        calls["n"] += 1
+        if "MACRO ANALYST" in prompt:
+            raise TimeoutError("read timed out")
+        return original(prompt)
+    quick.invoke = flaky
+
+    result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW)
+
+    assert len(result.orders) == 1
+    assert result.problems == ["Macro analyst: the model timed out"]
+    assert "unavailable" in result.transcript["Macro analyst"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("message, reason", [
+    ("429 RESOURCE_EXHAUSTED quota exceeded", "daily quota used up"),
+    ("Error code: 429 - rate limit reached", "rate-limited by the provider"),
+    ("Error code: 401 - Incorrect API key provided", "API key refused"),
+    ("Request timed out.", "the model timed out"),
+    ("something odd\nwith detail", "something odd"),
+])
+def test_provider_errors_become_one_line(message, reason):
+    assert fx_agents.short_reason(RuntimeError(message)) == reason
+
+
+@pytest.mark.unit
+def test_the_desk_rules_name_the_close_and_the_missing_actuals():
+    text = fx_agents.GROUND_RULES
+    assert "17:00 close" in text and "never the actual result" in text
+
+
+@pytest.mark.unit
+def test_smc_candidates_show_their_zone_and_invalidation():
+    s = _setup()
+    s.strategy, s.zone_low, s.zone_high, s.invalidation = "smc", 1.1695, 1.1705, 1.1688
+    text = fx_agents.evidence([s], _ctx([s]))
+    assert "entry zone 1.1695–1.1705" in text and "sweep extreme 1.1688" in text
+
+
+@pytest.mark.unit
+def test_an_smc_order_cannot_outlive_its_session():
+    s = _setup(entry=1.1700, stop=1.1683, target=1.1745)
+    s.strategy, s.zone_low, s.zone_high, s.invalidation = "smc", 1.1695, 1.1705, 1.1688
+    s.expires_at = NOW + timedelta(hours=1)
+    accepted, _ = verify([{"symbol": "EURUSD", "entry": 1.1700, "stop": 1.1683, "target": 1.1745,
+                           "valid_hours": 6}], [s], now=NOW)
+    assert accepted[0].expires_at == NOW + timedelta(hours=1)
+    assert "session end" in accepted[0].notes[0]

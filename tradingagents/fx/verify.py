@@ -89,11 +89,24 @@ def check_levels(setup: Setup, entry: float, stop: float, target: float,
         return f"a buy limit must sit below the price at scan time ({setup.price})"
     if not long and entry <= setup.price:
         return f"a sell limit must sit above the price at scan time ({setup.price})"
-    if abs(entry - setup.entry) > MAX_SHIFT_ATR * atr:
-        return (f"entry moved {spec.pips(abs(entry - setup.entry)):.0f} pips from the scanner's "
-                f"level, more than {MAX_SHIFT_ATR} ATR")
-    if abs(entry - stop) < MIN_STOP_ATR * atr:
-        return f"stop is tighter than {MIN_STOP_ATR} ATR ({MIN_STOP_ATR * setup.atr_pips:.1f} pips)"
+    if setup.strategy == "smc" and setup.zone_low is not None:
+        # The trade is defined by its zone and its sweep: the entry stays in the
+        # order block / FVG, and the stop stays beyond the swept extreme, where
+        # the idea is proven wrong.
+        slack = 0.1 * (setup.zone_high - setup.zone_low) + spec.pip / 10
+        if not setup.zone_low - slack <= entry <= setup.zone_high + slack:
+            return (f"entry {entry} is not inside the {setup.zone_low}–{setup.zone_high} "
+                    "order block / fair value gap")
+        if long and stop >= setup.invalidation:
+            return f"stop {stop} is not beyond the sweep low ({setup.invalidation})"
+        if not long and stop <= setup.invalidation:
+            return f"stop {stop} is not beyond the sweep high ({setup.invalidation})"
+    else:
+        if abs(entry - setup.entry) > MAX_SHIFT_ATR * atr:
+            return (f"entry moved {spec.pips(abs(entry - setup.entry)):.0f} pips from the scanner's "
+                    f"level, more than {MAX_SHIFT_ATR} ATR")
+        if abs(entry - stop) < MIN_STOP_ATR * atr:
+            return f"stop is tighter than {MIN_STOP_ATR} ATR ({MIN_STOP_ATR * setup.atr_pips:.1f} pips)"
     rr = rr_after_spread(setup, entry, stop, target)
     if rr < min_rr:
         return f"RR after the spread is {rr:.2f}, below {min_rr:g}"
@@ -164,6 +177,10 @@ def verify(
         clamped = min(max(hours, MIN_HOURS), MAX_HOURS)
         if clamped != hours:
             notes.append(f"validity {hours:g}h clamped to {clamped:g}h")
+        expires = now + timedelta(hours=clamped)
+        if setup.strategy == "smc" and expires > setup.expires_at:
+            expires = setup.expires_at
+            notes.append(f"cancel time capped at the session end, {expires:%H:%M} UTC")
         conviction = str(p.get("conviction", "low")).lower()
         if conviction not in ("low", "medium", "high"):
             conviction = "low"
@@ -172,7 +189,7 @@ def verify(
             setup=setup,
             entry=entry, stop=stop, target=target,
             rr=round(rr_after_spread(setup, entry, stop, target), 2),
-            expires_at=now + timedelta(hours=clamped),
+            expires_at=expires,
             conviction=conviction,
             rationale=str(p.get("rationale", "")).strip(),
             watch_for=str(p.get("watch_for", "")).strip(),

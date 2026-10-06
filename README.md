@@ -358,31 +358,51 @@ _, decision = ta.propagate("NVDA", "2026-09-01")
 
 ## Forex and metals scanner
 
-`tradingagents fx-scan` looks for intraday limit-order setups across seven major pairs, five crosses, gold and silver, using spot prices from OANDA. It runs no AI and costs nothing: it is the first stage of a morning scan whose candidates the agents will review.
+`tradingagents fx-scan` looks for intraday limit-order setups across seven major pairs, five crosses, gold and silver, using spot prices from OANDA. The scan itself runs no AI and costs nothing; `--agents` adds the agent review below.
 
 ```bash
-tradingagents fx-scan                              # default instruments, RR ≥ 2, top 10
-tradingagents fx-scan --symbols EURUSD,XAUUSD --min-rr 2.5 --top 6
+tradingagents fx-scan                              # SMC strategy, London/NY sessions, RR ≥ 2
+tradingagents fx-scan --agents                     # plus the agent review: up to 6 final orders
+tradingagents fx-scan --symbols EURUSD,XAUUSD --min-rr 2.5
+tradingagents fx-scan --strategy trend             # the original trend-pullback rules
 ```
 
-For each instrument it requires a clear 4-hour trend (price, 50 EMA and 200 EMA stacked, the 50 sloping with it), finds a 1-hour swing level or the 1-hour 50 EMA that a pullback could reach within 0.3–2.5 ATR, and places a limit just ahead of it with the stop one 1-hour ATR beyond (`--stop-atr` to change). The target is the nearest intact 1-hour swing on the other side paying the minimum reward-to-risk after the spread, or 2.5R when price is at new extremes. The list holds at most two trades long or short the same currency (`--max-per-currency` to change). Each setup is scored out of 100 for ranking, with full marks reserved for a strong trend, a well-tested level and a swing level that coincides with the 1-hour 50 EMA; the score is not a win probability.
+### SMC strategy (default)
 
-It needs `OANDA_API_TOKEN` (a free practice account's token reads live prices) and saves each scan to `<results_dir>/fx_scans/` as Markdown and JSON.
+Every structure is detected in code from closed candles, so each level in a setup can be found on a chart. For a long (shorts mirror it):
+
+1. **1-hour bias**: the latest break of structure on H1 is up.
+2. **Sweep**: in the last six hours a 5-minute bar traded below sell-side liquidity (the previous trading day's low, the Asian or London session low, or equal lows) and closed back above it. A pool counts only once it has formed.
+3. **Structure shift**: within three hours of the sweep, a 5-minute close breaks the last swing high (BOS or CHoCH).
+4. **Entry**: a buy limit at the middle of the unmitigated fair value gap the displacement left, preferring one inside the order block (the last down-close candle before the move), else the order block itself.
+5. **Stop** beyond the sweep's wick; **target** at the nearest buy-side liquidity above price (previous day high, session high, equal highs, an intact H1 swing high) paying at least the minimum RR after the spread.
+6. **Sessions**: setups are built only during London (07:00–11:00 London time) and New York (08:00–12:00 New York time), and an unfilled order is cancelled when its session ends (`--any-session` to scan at other times). Trading days roll at 17:00 New York.
+
+Each setup is scored out of 100 from the swept pool (previous day > session > equal highs/lows), displacement, FVG/order-block confluence, entry depth (discount or premium), the H1 break, reward-to-risk and freshness. The score ranks setups; it is not a win probability.
+
+### Trend strategy
+
+`--strategy trend` keeps the original rules: a clear 4-hour trend (price, 50 EMA and 200 EMA stacked), a pullback limit at a 1-hour swing level or the 1-hour 50 EMA within 0.3–2.5 ATR, the stop one 1-hour ATR beyond (`--stop-atr`), and the nearest intact 1-hour swing as the target.
+
+Both strategies hold at most two trades long or short the same currency (`--max-per-currency`), need `OANDA_API_TOKEN` (a free practice account's token reads live prices), and save each scan to `<results_dir>/fx_scans/` as Markdown and JSON.
 
 ### Agent review
 
 `tradingagents fx-scan --agents` passes the candidates to an agent team built on the same roles as the stock pipeline and picks up to six final limit orders (`--final` to change):
 
-1. **Macro analyst** reads this week's economic calendar (high- and medium-impact releases per currency, gold and silver as USD) and the latest headlines, and briefs the desk on each currency's driver and event risk.
-2. **Bull and bear researchers** argue for and against every setup.
-3. **Research manager** (deep model) decides which survive the debate, dropping setups exposed to a release before they would play out.
-4. **Trader** writes the orders, keeping the scanner's levels unless the debate gives a reason to move them.
-5. **Aggressive, neutral and conservative risk analysts** review the book as a whole: shared currencies, correlated pairs, orders that could fill into the same release.
-6. **Portfolio manager** (deep model) chooses the final book and each order's cancel time.
+1. **Macro analyst** reads this week's economic calendar (high- and medium-impact releases per currency, gold and silver as USD) and the latest FXStreet headlines, and briefs the desk on each currency's driver and event risk.
+2. **Price-action analyst** grades each setup's structure: the liquidity taken, the strength of the shift, the order block / FVG, discount or premium, and whether the target is realistic for the session.
+3. **Bull and bear researchers** argue for and against every setup.
+4. **Research manager** (deep model) decides which survive the debate, dropping setups exposed to a release before they would play out.
+5. **Trader** writes the orders, keeping the scanner's levels unless the debate gives a reason to move them.
+6. **Aggressive, neutral and conservative risk analysts** review the book as a whole: shared currencies, correlated pairs, orders that could fill into the same release.
+7. **Portfolio manager** (deep model) chooses the final book and each order's cancel time.
 
-Every agent sees all candidates at once, so a review is nine model calls whatever the number of candidates. The final orders are then checked in code against the scanner's facts: the right side of price, an entry within 1.5 ATR of the scanner's level, a stop at least 0.5 ATR away, the minimum RR after the spread, and the per-currency cap. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.
+Every agent sees all candidates at once, so a review is ten model calls whatever the number of candidates. If the deep model fails (a spent free quota, say), the two managers fall back to the quick model before any rule-based fallback, and every failure is reported in one line.
 
-The review uses the provider and models set in `.env` (`TRADINGAGENTS_LLM_PROVIDER` and the quick and deep models). The economic calendar is the Forex Factory weekly feed, cached for an hour; when it cannot be read, the agents are told event risk is unknown rather than absent.
+The final orders are then checked in code against the scanner's facts: the right side of price, the minimum RR after the spread and the per-currency cap; for SMC setups an entry inside the order block / FVG, a stop beyond the sweep and a cancel time no later than the session end; for trend setups an entry within 1.5 ATR of the scanner's level and a stop at least 0.5 ATR away. An adjusted order that fails reverts to the scanner's levels; one that cannot be repaired is dropped with the reason. The report leads with the final orders and keeps every agent's reasoning below them.
+
+The review uses the provider and models set in `.env` (`TRADINGAGENTS_LLM_PROVIDER` and the quick and deep models). Headlines come from FXStreet's public news feed (Yahoo Finance when it cannot be read), matched to each pair by currency, central bank and nickname. The economic calendar is the Forex Factory weekly feed, cached for an hour; it carries forecasts but not actual results, and when it cannot be read the agents are told event risk is unknown rather than absent.
 
 ## Evaluating decisions over time
 

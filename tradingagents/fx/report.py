@@ -62,6 +62,8 @@ def to_markdown(result: ScanResult, review: Review | None = None) -> str:
         return "\n".join(lines)
 
     lines = [f"# Forex & metals: agent-reviewed orders — {when}", "", f"_{AGENT_DISCLAIMER}_", ""]
+    if review.problems:
+        lines += ["> **Model problems:** " + " · ".join(review.problems), ""]
     if review.fallbacks:
         lines += ["> **Partial review.** " + " · ".join(review.fallbacks), ""]
     lines += ["## Final orders", ""]
