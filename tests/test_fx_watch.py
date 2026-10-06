@@ -85,6 +85,25 @@ def test_the_daily_agent_cap_is_respected_and_resets(tmp_path):
 
 
 @pytest.mark.unit
+def test_a_restart_remembers_what_was_reviewed_today(tmp_path):
+    h = Harness(tmp_path, [_setup()])
+    assert h.run(NOW, max_agent_runs=2).reviewed
+    h.state = WatchState()                                        # the watcher was restarted
+    again = h.run(NOW + timedelta(minutes=10), max_agent_runs=2)
+    assert not again.reviewed and h.reviews == 1                  # same setup, no new ticket
+
+    h.setups.append(_setup("GBPUSD"))
+    h.state = WatchState()
+    assert h.run(NOW + timedelta(minutes=20), max_agent_runs=2).reviewed
+    h.setups.append(_setup("USDJPY"))
+    h.state = WatchState()
+    capped = h.run(NOW + timedelta(minutes=30), max_agent_runs=2)
+    assert not capped.reviewed and "limit reached" in capped.notes[0]   # the count survived too
+    h.state = WatchState()
+    assert h.run(NOW + timedelta(days=1), max_agent_runs=2).reviewed     # a new day starts fresh
+
+
+@pytest.mark.unit
 def test_outside_the_window_it_only_settles_and_sums_up_once(tmp_path):
     h = Harness(tmp_path, [_setup()])
     h.run(NOW)

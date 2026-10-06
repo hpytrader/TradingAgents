@@ -214,7 +214,8 @@ sentences: central-bank stance, the latest data surprise, risk sentiment.
 2. Event risk: list every release before the candidates expire, its time, the currencies it \
 moves and how dangerous it is for a limit order waiting to fill.
 3. Anything in the headlines that cuts against a candidate's direction.
-Say plainly when evidence is missing. Under 400 words.
+Chart levels and zone quality are the price-action analyst's job, not yours: don't remark \
+that zones or levels are missing. Say plainly when macro evidence is missing. Under 400 words.
 
 {macro_evidence(candidates, ctx)}""")
 
@@ -348,7 +349,9 @@ def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx,
     return _say(llm, f"""{GROUND_RULES}
 
 You are {people[f"risk_{stance}"].name}, the {stance.upper()} RISK ANALYST reviewing the trader's book as a whole. {view} \
-Name specific symbols. Under 250 words.{replies}
+Name specific symbols. \
+Zone quality was already judged by the price-action analyst and research manager; weigh \
+the book's risk (event timing, correlation, size, conviction), not the chart levels. Under 250 words.{replies}
 
 ## Macro brief
 {macro}

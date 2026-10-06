@@ -199,6 +199,16 @@ class Journal:
         with closing(self._connect()) as db, db:
             return {symbol: self._next(db) for symbol in symbols}
 
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        """A stored setting, e.g. what the watcher reviewed today; ``default`` if unset."""
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with closing(self._connect()) as db, db:
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
