@@ -28,7 +28,7 @@ from tradingagents.fx.context import ReviewContext
 from tradingagents.fx.scanner import Setup
 from tradingagents.fx.schemas import FinalBook, ManagementPlan, ResearchVerdict, TraderPlan
 from tradingagents.fx.team import team
-from tradingagents.fx.verify import VerifiedOrder, verify
+from tradingagents.fx.verify import VerifiedOrder, resolve_symbol, verify
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +88,8 @@ def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
         f"- Stop {s.stop} ({s.risk_pips} pips), target {s.target} ({s.reward_pips} pips, "
         f"{s.target_kind}), {s.rr:.2f}R after a {s.spread_pips}-pip spread",
         f"- Price at scan {s.price}; 1h ATR {s.atr_pips} pips; scanner score {s.score:.0f}/100",
-        *([f"- SMC setup: entry zone {s.zone_low}–{s.zone_high}; idea invalid beyond the "
-           f"sweep extreme {s.invalidation}"] if s.strategy == "smc" else []),
+        *([f"- SMC setup: entry zone {s.zone_low}–{s.zone_high}; idea invalid beyond the extreme of the move "
+           f"{s.invalidation} (trading back through the swept level is normal; past this is not)"] if s.strategy == "smc" else []),
         f"- Order expires {s.expires_at:%H:%M} UTC unless cancelled sooner",
     ]
     lines += [f"- {reason}" for reason in s.reasons]
@@ -424,10 +424,6 @@ def _render_book(book: FinalBook) -> str:
     return "\n".join(lines)
 
 
-def _normal(symbol: str) -> str:
-    return symbol.upper().replace("/", "").replace("_", "").rstrip("+")
-
-
 # ---------------------------------------------------------------------------
 # The review
 # ---------------------------------------------------------------------------
@@ -523,6 +519,9 @@ def review(
         return Review(orders=[], dropped=[], summary="The scanner found no candidates to review.")
 
     ctx.tickets = dict(tickets) if tickets else {c.symbol: f"#{i}" for i, c in enumerate(candidates, 1)}
+
+    def norm(text) -> str:
+        return resolve_symbol(text, by_symbol, ctx.tickets)
     management: list[dict] = []
     book_text = ""
     if positions:
@@ -579,8 +578,8 @@ def review(
         kept = list(candidates)
         verdict_text = "(research manager unavailable: all candidates kept)"
     else:
-        keep = {_normal(d.symbol) for d in verdict.decisions if d.keep}
-        reasons = {_normal(d.symbol): d.reason for d in verdict.decisions}
+        keep = {norm(d.symbol) for d in verdict.decisions if d.keep}
+        reasons = {norm(d.symbol): d.reason for d in verdict.decisions}
         kept = [s for s in candidates if s.symbol in keep]
         for s in candidates:
             if s.symbol not in keep:
@@ -601,9 +600,9 @@ def review(
         fallbacks.append("Trader: no usable answer; scanner levels used")
         orders = []
     else:
-        orders = [{"symbol": _normal(o.symbol), "entry": o.entry, "stop": o.stop,
+        orders = [{"symbol": norm(o.symbol), "entry": o.entry, "stop": o.stop,
                    "target": o.target, "note": o.note}
-                  for o in plan.orders if _normal(o.symbol) in kept_symbols]
+                  for o in plan.orders if norm(o.symbol) in kept_symbols]
     written = {o["symbol"] for o in orders}
     orders += [{"symbol": s.symbol, "entry": s.entry, "stop": s.stop, "target": s.target,
                 "note": "scanner levels"} for s in kept if s.symbol not in written]
@@ -639,9 +638,9 @@ def review(
         summary = "The portfolio manager gave no usable answer, so the trader's book is shown."
     else:
         transcript["Portfolio manager"] = _render_book(book)
-        proposals = [o.model_dump() for o in book.orders]
+        proposals = [{**o.model_dump(), "symbol": norm(o.symbol)} for o in book.orders]
         summary = book.summary
-        chosen = {_normal(o.symbol) for o in book.orders}
+        chosen = {norm(o.symbol) for o in book.orders}
         for o in orders:
             if o["symbol"] not in chosen:
                 dropped.append((o["symbol"], "portfolio manager left it out of the final book"))

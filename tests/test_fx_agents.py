@@ -405,7 +405,7 @@ def test_smc_candidates_show_their_zone_and_invalidation():
     s = _setup()
     s.strategy, s.zone_low, s.zone_high, s.invalidation = "smc", 1.1695, 1.1705, 1.1688
     text = fx_agents.evidence([s], _ctx([s]))
-    assert "entry zone 1.1695–1.1705" in text and "sweep extreme 1.1688" in text
+    assert "entry zone 1.1695–1.1705" in text and "extreme of the move 1.1688" in text
 
 
 @pytest.mark.unit
@@ -466,3 +466,39 @@ def test_later_high_impact_releases_are_dated_for_the_agents():
     assert "Wed 18:00 UTC · USD · High: FOMC Meeting Minutes" in text
     assert "Waller" not in text                              # only high impact is listed
     assert "find its time in the calendar" in fx_agents.GROUND_RULES
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("written, meant", [
+    ("#1026 XAGUSD", "XAGUSD"), ("XAG/USD", "XAGUSD"), ("#1026", "XAGUSD"), ("xagusd", "XAGUSD"),
+    ("1027 EUR/USD", "EURUSD"), ("NZDUSD", "NZDUSD"),
+])
+def test_symbols_are_recognised_however_the_agents_write_them(written, meant):
+    from tradingagents.fx.verify import resolve_symbol
+
+    assert resolve_symbol(written, {"XAGUSD", "EURUSD"}, {"XAGUSD": "#1026", "EURUSD": "#1027"}) == meant
+
+
+@pytest.mark.unit
+def test_ticketed_verdicts_reach_the_book():
+    # 2026-10-06 15:29 UTC: Sage kept "#1026 XAGUSD" and "#1027 EURUSD", and the
+    # desk dropped everything as "no verdict given".
+    candidates = [_setup("EURUSD"), _setup("USDJPY", "short")]
+    tickets = {"EURUSD": "#1027", "USDJPY": "#1028"}
+    verdict = ResearchVerdict(summary="s", decisions=[
+        SetupVerdict(symbol="#1027 EURUSD", keep=True, reason="clean"),
+        SetupVerdict(symbol="#1028 USD/JPY", keep=False, reason="against the trend")])
+    eur = candidates[0]
+    plan = TraderPlan(orders=[TraderOrder(symbol="#1027 EURUSD", entry=eur.entry, stop=eur.stop,
+                                          target=eur.target, note="kept")])
+    book = FinalBook(summary="one", orders=[FinalOrder(
+        symbol="EUR/USD #1027", entry=eur.entry, stop=eur.stop, target=eur.target, valid_hours=3,
+        conviction="medium", rationale="r", watch_for="w")])
+    quick = FakeLLM("quick", {TraderPlan: plan})
+    deep = FakeLLM("deep", {ResearchVerdict: verdict, FinalBook: book})
+
+    result = fx_agents.review(candidates, _ctx(candidates), quick, deep, now=NOW, tickets=tickets)
+
+    assert [o.symbol for o in result.orders] == ["EURUSD"]
+    assert dict(result.dropped)["USDJPY"] == "research manager: against the trend"
+    assert "no verdict given" not in str(result.dropped)
