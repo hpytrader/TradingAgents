@@ -642,3 +642,64 @@ def review(
         note += "\n" + "\n".join(f"! {x}" for x in problems + fallbacks)
     post("desk", "Verification", note, "system")
     return finish(orders=accepted, dropped=dropped, summary=summary)
+
+
+def check_trades(
+    positions: list,
+    ctx: ReviewContext,
+    quick_llm: Any,
+    deep_llm: Any,
+    *,
+    now: datetime | None = None,
+) -> Review:
+    """Ward's own check of the live book, between full reviews.
+
+    One model call: the trade manager reads the live trades with the calendar
+    and headlines for their currencies, and decides hold / close / move stop /
+    move target / cancel. The result has no new orders; its ``management`` is
+    applied and verified by :func:`tradingagents.fx.watch.file_review` exactly
+    as in a full review, and the exchange is saved as a desk-chat session.
+    """
+    from types import SimpleNamespace
+
+    from tradingagents.fx.manage import describe
+
+    now = now or ctx.now
+    people = team()
+    messages: list[dict] = []
+    problems: list[str] = []
+    fallbacks: list[str] = []
+
+    def post(key: str, title: str, text: str, kind: str = "message"):
+        who = people[key]
+        messages.append({"agent": key, "name": who.name, "role": who.role, "title": title,
+                         "kind": kind, "text": text})
+
+    book_text = describe(positions)
+    live = sum(p.entry.status == "open" for p in positions)
+    post("desk", "Ward check", f"Scheduled check of the live book: {live} open, "
+                               f"{len(positions) - live} pending.\n{book_text}", "system")
+
+    trades = [SimpleNamespace(symbol=p.entry.symbol, direction=p.entry.direction) for p in positions]
+    evidence_text = macro_evidence(trades, ctx)        # calendar and headlines for these currencies
+
+    plan = trade_manager(deep_llm, book_text, evidence_text, ctx, problems)
+    if plan is None and quick_llm is not deep_llm:
+        plan = trade_manager(quick_llm, book_text, evidence_text, ctx, problems)
+        if plan is not None:
+            fallbacks.append(f"Trade manager: decided by the fast model (strong model: "
+                             f"{problems[-1].split(': ', 1)[-1]})")
+    management: list[dict] = []
+    if plan is None:
+        post("trade_manager", "Live trades", "(no usable answer: every trade is held as it is)", "decision")
+        summary = "Ward gave no usable answer; every trade is held."
+    else:
+        management = [a.model_dump() for a in plan.actions]
+        lines = [plan.summary, ""]
+        for a in plan.actions:
+            detail = {"move_stop": f" → stop {a.new_stop}", "move_target": f" → target {a.new_target}"}.get(a.action, "")
+            lines.append(f"- {a.ticket}: {a.action.upper().replace('_', ' ')}{detail}. {a.reason}")
+        post("trade_manager", "Live trades", "\n".join(lines), "decision")
+        summary = plan.summary
+    return Review(orders=[], dropped=[], summary=summary, messages=messages, fallbacks=fallbacks,
+                  problems=problems, management=management, positions=positions)
