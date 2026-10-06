@@ -250,6 +250,12 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         hours = age.total_seconds() / 3600
         return (f"the structure shift at {m5.index[shift.i]:%H:%M} UTC is {hours:.1f}h old; "
                 "the move has most likely played out")
+    # The idea is wrong if price goes beyond the extreme of the whole move from
+    # the sweep to the shift, not only the sweeping candle's wick: price can
+    # keep running a few candles after taking the liquidity before it turns.
+    move = m5.iloc[sweep.i:shift.i + 1]
+    extreme = float(move["low"].min()) if long else float(move["high"].max())
+    shift_close = float(m5["close"].iat[shift.i])
     ob = smc.order_block(m5, sweep.i, shift.i, up)
     gaps = smc.fair_value_gaps(m5, sweep.i, shift.i, up)
     # Zones in order of preference: a gap inside the order block, other gaps
@@ -264,7 +270,11 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         return "structure shift without an order block or fair value gap to enter at"
 
     zone = confluence = None
+    beyond_extreme = False
     for candidate, label in options:
+        if (candidate.mid - extreme) * sign <= 0:      # at or past the invalidation: not an entry
+            beyond_extreme = True
+            continue
         if smc.mitigated(m5, candidate, candidate.mid, up, after=shift.i):
             continue
         if (mid - candidate.mid) * sign <= spread:
@@ -272,6 +282,8 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         zone, confluence = candidate, label
         break
     if zone is None:
+        if beyond_extreme and all((z.mid - extreme) * sign <= 0 for z, _ in options):
+            return "the only order block / fair value gap sits beyond the low of the move, past invalidation"
         kinds = " and ".join(sorted({z.kind for z, _ in options}))
         return f"every {kinds} from the move has already been traded back into"
 
@@ -280,7 +292,7 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         return (f"the {zone.kind} is {abs(mid - entry) / atr1:.1f}× the hourly range from price; "
                 "a limit there is unlikely to fill this session")
     buffer = max(3 * spread, 0.3 * atr5)
-    stop = sweep.extreme - sign * buffer
+    stop = extreme - sign * buffer
     widened = False
     if abs(entry - stop) < MIN_RISK_H1_ATR * atr1:
         # In a quiet market the sweep wick can sit almost on the entry; a stop
@@ -297,8 +309,7 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
     reward = abs(target - entry)
     rr = (reward - spread) / (risk + spread)
 
-    shift_close = float(m5["close"].iat[shift.i])
-    leg = abs(shift_close - sweep.extreme)
+    leg = abs(shift_close - extreme)
     displacement = leg / atr5
     depth = abs(shift_close - entry) / leg if leg else 0.0          # 0 = top of leg, 1 = sweep
     minutes = (now - m5.index[shift.i].to_pydatetime()).total_seconds() / 60
@@ -328,7 +339,7 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         strategy="smc",
         zone_low=spec.round_price(zone.low),
         zone_high=spec.round_price(zone.high),
-        invalidation=spec.round_price(sweep.extreme),
+        invalidation=spec.round_price(extreme),
     )
 
 

@@ -101,6 +101,10 @@ def check_levels(setup: Setup, entry: float, stop: float, target: float,
         if not setup.zone_low - slack <= entry <= setup.zone_high + slack:
             return (f"entry {entry} is not inside the {setup.zone_low}–{setup.zone_high} "
                     "order block / fair value gap")
+        if long and entry <= setup.invalidation:
+            return f"entry {entry} is at or below the low of the move ({setup.invalidation}), past invalidation"
+        if not long and entry >= setup.invalidation:
+            return f"entry {entry} is at or above the high of the move ({setup.invalidation}), past invalidation"
         if long and stop >= setup.invalidation:
             return f"stop {stop} is not beyond the sweep low ({setup.invalidation})"
         if not long and stop <= setup.invalidation:
