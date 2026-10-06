@@ -67,6 +67,31 @@ class VerifiedOrder:
         }
 
 
+def resolve_symbol(text, symbols, tickets: dict[str, str] | None = None) -> str:
+    """The candidate a model meant, from however it wrote it.
+
+    Models given tickets write "#1026 XAGUSD", "XAG/USD", "#1026" or plain
+    "XAGUSD" in a symbol field; all of them mean XAGUSD. Returns the cleaned
+    text unchanged when it names no known candidate, so a made-up symbol is
+    still reported as one.
+    """
+    import re
+
+    raw = str(text or "").upper().replace("/", "").replace("_", "").replace("-", "")
+    plain = raw.strip().rstrip("+")
+    known = set(symbols)
+    if plain in known:
+        return plain
+    for symbol in known:
+        if re.search(rf"(?<![A-Z]){symbol}(?![A-Z])", raw):
+            return symbol
+    for symbol, ticket in (tickets or {}).items():
+        number = str(ticket).lstrip("#")
+        if number and re.search(rf"(?<!\d)#?{re.escape(number)}(?!\d)", raw):
+            return symbol
+    return plain
+
+
 def rr_after_spread(setup: Setup, entry: float, stop: float, target: float) -> float:
     spread = spec_for(setup.symbol).pip * setup.spread_pips
     risk = abs(entry - stop)
@@ -143,7 +168,7 @@ def verify(
     seen: set[str] = set()
 
     for p in proposals:
-        symbol = str(p.get("symbol", "")).upper().replace("/", "").replace("_", "").rstrip("+")
+        symbol = resolve_symbol(p.get("symbol", ""), by_symbol)
         setup = by_symbol.get(symbol)
         if setup is None:
             dropped.append((symbol or "?", "not one of the scanner's candidates"))

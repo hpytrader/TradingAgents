@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 
 class SetupVerdict(BaseModel):
-    symbol: str = Field(description="The candidate's symbol exactly as listed, e.g. EURUSD.")
+    symbol: str = Field(description="The candidate's symbol only, e.g. EURUSD, without its ticket.")
     keep: bool = Field(description="True to pass the setup to the trader, False to drop it.")
     reason: str = Field(description="One or two sentences: the deciding argument from the debate.")
 
@@ -25,7 +25,7 @@ class ResearchVerdict(BaseModel):
 
 
 class TraderOrder(BaseModel):
-    symbol: str = Field(description="A symbol the research manager kept.")
+    symbol: str = Field(description="A symbol the research manager kept, e.g. EURUSD, without its ticket.")
     entry: float = Field(description="Limit price. Keep the scanner's level unless there is a reason to move it.")
     stop: float = Field(description="Stop-loss price, beyond the entry level.")
     target: float = Field(description="Take-profit price.")
@@ -37,7 +37,7 @@ class TraderPlan(BaseModel):
 
 
 class FinalOrder(BaseModel):
-    symbol: str = Field(description="A symbol from the trader's plan.")
+    symbol: str = Field(description="A symbol from the trader's plan, e.g. EURUSD, without its ticket.")
     entry: float = Field(description="Limit price.")
     stop: float = Field(description="Stop-loss price.")
     target: float = Field(description="Take-profit price.")
