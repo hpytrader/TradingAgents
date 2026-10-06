@@ -567,7 +567,7 @@ def fx_mt4(
     lots: float = typer.Option(None, "--lots", help="Lot size for every order (default 0.01)"),
     symbol: str = typer.Option(None, "--symbol", help="Map symbols to the broker's names, e.g. XAUUSD=GOLD,XAGUSD=SILVER"),
     flatten: bool = typer.Option(False, "--flatten", help="Cancel every pending order and close every trade of the desk in MT4 now"),
-    test_order: str = typer.Option(None, "--test-order", help="Place a buy limit 1%% under the price on this symbol (e.g. EURUSD or USDJPY.r) and cancel it at once"),
+    test_order: str = typer.Option(None, "--test-order", help="Place a buy limit 1% under the price on this symbol (e.g. EURUSD or USDJPY.r) and cancel it at once"),
 ):
     """Connect the desk to MetaTrader 4 (e.g. CMC Markets): setup, status, a test order, and an emergency flatten."""
     import time as clock
