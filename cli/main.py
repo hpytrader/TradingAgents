@@ -681,6 +681,7 @@ def fx_lab(
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     final: int = typer.Option(6, "--final", help="Most new orders per scan"),
     experiments: bool = typer.Option(False, "--experiments", help="Run Quinn's ideas: design year, then the locked year"),
+    anatomy: bool = typer.Option(False, "--anatomy", help="Study how the design year's trades played out: costs, stops, exits"),
     refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
     notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
 ):
@@ -705,14 +706,14 @@ def fx_lab(
     locked_start = start - span                     # the year before: Quinn's locked test year
     history = lab.History(lab.lab_dir() / "history")
     rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final)
-    title = "experiments" if experiments else "baseline"
+    title = "anatomy" if anatomy else "experiments" if experiments else "baseline"
     console.print(f"[bold]Quinn's lab · {title}[/bold] · design year {start:%d %b %Y} to {end:%d %b %Y}"
-                  + (f" · locked year {locked_start:%d %b %Y} to {start:%d %b %Y}" if experiments else "")
+                  + (f" · locked year {locked_start:%d %b %Y} to {start:%d %b %Y}" if experiments and not anatomy else "")
                   + f" · {len(names)} instruments · scans every {step} min, 02:00-12:00 New York")
 
     columns = (TextColumn("{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"),
                TimeRemainingColumn())
-    first = (locked_start if experiments else start) - lab.WARMUP
+    first = (locked_start if experiments and not anatomy else start) - lab.WARMUP
     frames = {}
     with Progress(*columns, console=console) as bar:
         job = bar.add_task("Price history", total=len(names) * len(lab.GRANULARITIES))
@@ -742,6 +743,43 @@ def fx_lab(
         return log
 
     design_log = scans(start, end, "Scanning the design year")
+    if anatomy:
+        from tradingagents.fx import anatomy as anat
+
+        console.print("Trading the design year and reading every trade's path…")
+        entries = lab.trade(design_log, feed, end, rules)
+        study, _ = anat.study(entries, frames)
+        console.print()
+        for line in study.findings:
+            head, _, rest = line.partition(": ")
+            console.print(f"[bold]{head}[/bold]: {rest}\n")
+        table = Table(title=f"Trade anatomy · {study.trades} filled trades")
+        table.add_column("Measure")
+        table.add_column("Value", justify="right")
+        for label, value in (
+            ("Per trade after / before the spread", f"{study.net_r:+.2f}R / {study.gross_r:+.2f}R"),
+            ("Spread as a share of the risk", f"{study.spread_share:.0%}"),
+            ("Losers +0.5R / +1R / +1.5R up first", " / ".join(f"{study.losers_mfe[k]:.0%}" for k in ("0.5R", "1R", "1.5R"))),
+            ("Winners 0.5R against us first", f"{study.winners_mae['0.5R']:.0%}"),
+            ("Losers stopped within 15 / 60 min", f"{study.stopped_within_15:.0%} / {study.stopped_within_60:.0%}"),
+            ("Losers that hit the target after the stop", f"{study.target_after_stop:.0%}"),
+            ("Closed at 17:00", f"{study.closed_at_17:.0%}"),
+            ("What if: break-even at +1R", f"{study.breakeven_r:+.2f}R"),
+            ("What if: half off at +1R", f"{study.half_off_r:+.2f}R"),
+            ("Losses with stop and target in one bar", f"{study.same_bar_losses:.0%}"),
+        ):
+            table.add_row(label, value)
+        console.print(table)
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+        md = lab.lab_dir() / f"anatomy-{stamp}.md"
+        md.write_text(anat.to_markdown(study, f"{start:%d %b %Y} to {end:%d %b %Y}"), encoding="utf-8")
+        console.print(f"Full report: {md}")
+        if notify and telegram.configured():
+            try:
+                telegram.send(anat.telegram_summary(study))
+            except telegram.TelegramError as exc:
+                console.print(f"[yellow]Telegram: {exc}[/yellow]")
+        return
     if not experiments:
         entries = lab.trade(design_log, feed, end, rules)
         report = lab.summarize(entries, start, end, used, rules)
