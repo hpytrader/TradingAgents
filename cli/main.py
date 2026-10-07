@@ -768,13 +768,19 @@ def fx_lab(
 
     locked_log = scans(locked_start, start, "Scanning the locked year")
     ledger = quinn.Ledger(lab.lab_dir() / "ledger.json")
+    console.print("Trading the unchanged rules on both years, for comparison…")
     base_design = quinn.measure(lab.trade(design_log, feed, end, rules))
     base_locked = quinn.measure(lab.trade(locked_log, feed, start, rules))
     rows = []
     for exp in quinn.FIRST_BATCH:
         console.print(f"Trying [bold]{exp.name}[/bold]: {exp.describe()}")
-        rows.append(quinn.run(exp, lambda e: lab.trade(design_log, feed, end, rules, e),
-                              lambda e: lab.trade(locked_log, feed, start, rules, e), base_design, ledger))
+        row = quinn.run(exp, lambda e: lab.trade(design_log, feed, end, rules, e),
+                        lambda e: lab.trade(locked_log, feed, start, rules, e), base_design, ledger)
+        d = row["design"]
+        console.print(f"  [dim]{d['trades']} trades, "
+                      f"{'—' if d['expectancy_r'] is None else format(d['expectancy_r'], '+.2f') + 'R'} per trade · "
+                      f"{row['status']}[/dim]")
+        rows.append(row)
     table = Table(title=f"Unchanged rules: {base_design.expectancy_r:+.2f}R per trade on the design year")
     for col in ("Idea", "Design trades", "Per trade", "PF", "Locked per trade", "t / bar", "Status"):
         table.add_column(col)
