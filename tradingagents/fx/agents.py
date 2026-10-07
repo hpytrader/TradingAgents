@@ -39,7 +39,8 @@ Desk rules: every order is a limit order. An unfilled order is cancelled at its 
 time (14:00 New York at the latest) or earlier for a release. A filled trade runs on its stop and \
 target; only the trade manager may change it (tighten the stop, move the target, close it early) \
 and it is closed at the New York 17:00 close (21:00 UTC in summer, 22:00 UTC in winter) at the \
-latest; nothing is held overnight.
+latest; nothing is held overnight. Every order is the same fixed size: there is no sizing \
+decision, so never suggest full, half or reduced size; the only choices are which orders to keep.
 A release after today's New York close cannot affect any of today's orders or trades: when a \
 headline mentions an event, find its time in the calendar before treating it as a risk.
 Never invent prices, news or data releases. The economic calendar lists times, forecasts and \
@@ -333,7 +334,7 @@ rule reverts to the scanner's levels.
 def risk_analyst(llm, stance: str, plan_text: str, macro: str, ctx,
                  heard: dict[str, str] | None = None, book_text: str = "") -> str:
     view = {
-        "aggressive": "Argue for taking the strongest setups at full size and for which "
+        "aggressive": "Argue for taking the strongest setups and for which "
                       "lower-conviction ones still deserve a place.",
         "neutral": "Weigh the trades' combined exposure: shared currencies, correlated "
                    "pairs, and how many orders could fill into the same release.",

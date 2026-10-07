@@ -521,3 +521,9 @@ def test_the_desk_rules_name_the_trade_manager_and_the_2pm_cancel():
     text = fx_agents.GROUND_RULES
     assert "only the trade manager may change it" in text and "14:00 New York at the latest" in text
     assert "managed only by its stop and target" not in text
+
+
+@pytest.mark.unit
+def test_the_desk_knows_every_order_is_the_same_size():
+    assert "same fixed size" in fx_agents.GROUND_RULES
+    assert "full size" not in fx_agents.risk_analyst.__code__.co_consts.__repr__()
