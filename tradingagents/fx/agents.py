@@ -38,8 +38,8 @@ GROUND_RULES = f"""You work on an intraday forex and metals desk. {NO_EXTERNAL_T
 Desk rules: every order is a limit order. An unfilled order is cancelled at its listed cancel \
 time (14:00 New York at the latest) or earlier for a release. A filled trade runs on its stop and \
 target; only the trade manager may change it (tighten the stop, move the target, close it early) \
-and it is closed at the New York 17:00 close (21:00 UTC in summer, 22:00 UTC in winter) at the \
-latest; nothing is held overnight. Every order is the same fixed size: there is no sizing \
+and it is closed at 16:55 New York (20:55 UTC in summer, 21:55 UTC in winter), five minutes \
+before the 17:00 close and its rollover, at the latest; nothing is held overnight. Every order is the same fixed size: there is no sizing \
 decision, so never suggest full, half or reduced size; the only choices are which orders to keep.
 A release after today's New York close cannot affect any of today's orders or trades: when a \
 headline mentions an event, find its time in the calendar before treating it as a risk.
@@ -101,7 +101,7 @@ def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
     else:
         events = ctx.upcoming.get(s.symbol, [])
         if events:
-            lines.append("- Releases before the New York 17:00 close (a filled order can run until then):")
+            lines.append("- Releases before the New York 17:00 close (a filled order can run until 16:55):")
             lines += [f"  - {e.describe()}"
                       + (" (after the order's cancel time: matters only if it has filled)" if e.time > s.expires_at else "")
                       for e in events]

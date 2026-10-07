@@ -98,7 +98,7 @@ def test_a_new_journal_order_is_placed_once_with_its_times(desk):
     assert cmd["lots"] == "0.01" and cmd["price"] == "1.1701" and cmd["sl"] == "1.1679" and cmd["tp"] == "1.1749"
     assert cmd["comment"] == "TA#1043"
     assert int(cmd["expires"]) == int(e.expires_at.timestamp())
-    assert int(cmd["close_by"]) == int(datetime(2026, 10, 6, 21, 0, tzinfo=UTC).timestamp())   # 17:00 NY
+    assert int(cmd["close_by"]) == int(datetime(2026, 10, 6, 20, 55, tzinfo=UTC).timestamp())  # 16:55 NY
     assert int(cmd["valid_until"]) == int((NOW + timedelta(minutes=2)).timestamp())
     assert any("placed" in m and "#1043" in m for m in desk.sent)
     assert desk.bridge.rows()["#1043"].state == "pending"

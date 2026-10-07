@@ -634,7 +634,7 @@ def render(entries: list[Entry], s: Stats, *, now: datetime | None = None, live:
 {_chat(reviews)}
 {_team(people)}
 <div class="foot">Paper results: each order is replayed on OANDA one-minute mid prices after it was suggested. A loss is −1R;
-a win or a close at the New York 17:00 close is charged the spread recorded at the scan. A minute that touches the entry
+a win or a close at 16:55 New York (before the 17:00 rollover) is charged the spread recorded at the scan. A minute that touches the entry
 and target together counts as no fill, and one that touches the stop and target as the stop. Real fills differ.
 Generated {_ny(now)} New York.</div></div></div>
 <div class="tip" id="tip"></div><script type="application/json" id="summary">{escape(data)}</script>

@@ -21,7 +21,7 @@ makes the MT4 book follow it, one step per order:
 
 A trade that filled at CMC otherwise runs on its own stop and target: CMC's
 prices, not the journal's, decide it. The EA cancels unfilled orders at their
-cancel time and closes trades at 17:00 New York itself, so both happen even if
+cancel time and closes trades at 16:55 New York itself, so both happen even if
 the watcher stops.
 """
 
@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tradingagents.fx.instruments import spec_for
-from tradingagents.fx.journal import ACTIVE, CANCELLED, CLOSED, PENDING, Entry, Journal, day_close
+from tradingagents.fx.journal import ACTIVE, CANCELLED, CLOSED, PENDING, Entry, Journal, flat_by
 
 EA_FILE = Path(__file__).with_name("TradingAgentsBridge.mq4")
 STALE_AFTER = timedelta(seconds=90)         # no state file this fresh: the EA is not running
@@ -635,7 +635,7 @@ class Bridge:
             "place", now, ticket=e.ticket, symbol=broker, side=side, lots=f"{self.lots:.2f}",
             price=_price(entry), sl=_price(sl), tp=_price(tp),
             comment=f"TA{e.ticket}", expires=int(e.expires_at.timestamp()),
-            close_by=int(day_close(e.created_at).timestamp()))
+            close_by=int(flat_by(e.created_at).timestamp()))
         row.inflight_action, row.inflight_at = "place", now
         self._save(row, now)
         notes.append(f"sent {e.ticket} {e.symbol} to MT4")
@@ -673,5 +673,5 @@ def _price(value: float) -> str:
 
 
 def _by_manager(e: Entry) -> bool:
-    """Closed or cancelled by the trade manager (not by the 17:00 close or the paper prices)."""
+    """Closed or cancelled by the trade manager (not by the 16:55 close or the paper prices)."""
     return bool(e.changes) and e.changes[-1].get("action") in ("close", "cancel")

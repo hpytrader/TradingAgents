@@ -9,7 +9,7 @@ rules as the live journal:
   day is not handed over again; at most ``final`` new orders per scan;
 - each order is a limit at the scanner's levels, cancelled at its cancel time
   (14:00 New York at the latest), settled bar by bar by the journal's own
-  simulator: the same fill, stop, target, missed and 17:00-close rules, with a
+  simulator: the same fill, stop, target, missed and 16:55-close rules, with a
   typical spread charged on every win.
 
 There are no agents in the baseline: it measures what the rules alone are
@@ -265,7 +265,7 @@ def _manage(feed: HistoricalFeed, e: Entry, how: str) -> None:
     from tradingagents.fx.anatomy import _bars, _what_if
     if e.filled_at is None or e.status not in jr.FINISHED:
         return
-    path = _bars(feed.frames[(e.symbol, "M5")], e.filled_at, jr.day_close(e.filled_at))
+    path = _bars(feed.frames[(e.symbol, "M5")], e.filled_at, jr.flat_by(e.filled_at))
     r = round(_what_if(e, path, half=how == "half_off"), 2)
     e.result_r = r
     e.status = jr.WON if r > 0 else jr.LOST if r <= -1 else jr.CLOSED

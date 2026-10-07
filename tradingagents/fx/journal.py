@@ -11,7 +11,8 @@ Settlement rules, applied bar by bar on mid prices:
   cancel time passes first, it is ``expired``.
 - **Open** once filled. The stop and target are then checked on every bar; a
   bar that reaches both counts as the stop (the conservative reading). A trade
-  still open at the New York 17:00 close is ``closed`` at that bar's price.
+  still open at 16:55 New York (five minutes before the 17:00 close and its
+  rollover) is ``closed`` at that bar's price.
 - A bar that touches the entry and the target together is ``missed``: within
   one minute the order of the two cannot be known, and a fill is not assumed.
 
@@ -410,6 +411,18 @@ def _bars(candles: CandleFetcher, symbol: str, since: datetime, now: datetime) -
     return frame[frame.index >= pd.Timestamp(since)]
 
 
+FLAT_BY = timedelta(minutes=5)          # every trade is closed this long before the 17:00 close
+
+
+def flat_by(t: datetime) -> datetime:
+    """16:55 New York on the trading day ``t`` falls in (UTC): when every trade is closed.
+
+    Five minutes before the 17:00 close, so no trade meets the rollover, when
+    spreads widen sharply and swap is charged.
+    """
+    return day_close(t) - FLAT_BY
+
+
 def day_close(t: datetime) -> datetime:
     """The New York 17:00 close that ends the trading day ``t`` falls in (UTC)."""
     local = t.astimezone(NEW_YORK)
@@ -473,14 +486,14 @@ def simulate(e: Entry, bars: pd.DataFrame, now: datetime) -> Entry:
                 e.status, e.note = EXPIRED, "not filled before the cancel time"
             return e
 
-    deadline = day_close(e.filled_at)
+    deadline = flat_by(e.filled_at)
     last_close = None
     while k < len(rows):
         bar = rows[k]
         t = bar.Index.to_pydatetime()
         if t >= deadline:
             price = last_close if last_close is not None else bar.open
-            return _exit(e, CLOSED, deadline, price, "still open at the New York 17:00 close")
+            return _exit(e, CLOSED, deadline, price, "still open at 16:55 New York, closed before the 17:00 close")
         stopped = bar.low <= e.stop if long else bar.high >= e.stop
         hit = bar.high >= e.target if long else bar.low <= e.target
         if stopped:
@@ -497,7 +510,7 @@ def simulate(e: Entry, bars: pd.DataFrame, now: datetime) -> Entry:
         e.settled_to = t + timedelta(seconds=1)
         k += 1
     if now >= deadline and last_close is not None:
-        return _exit(e, CLOSED, deadline, last_close, "still open at the New York 17:00 close")
+        return _exit(e, CLOSED, deadline, last_close, "still open at 16:55 New York, closed before the 17:00 close")
     return e
 
 

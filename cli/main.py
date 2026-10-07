@@ -764,7 +764,7 @@ def fx_lab(
             ("Winners 0.5R against us first", f"{study.winners_mae['0.5R']:.0%}"),
             ("Losers stopped within 15 / 60 min", f"{study.stopped_within_15:.0%} / {study.stopped_within_60:.0%}"),
             ("Losers that hit the target after the stop", f"{study.target_after_stop:.0%}"),
-            ("Closed at 17:00", f"{study.closed_at_17:.0%}"),
+            ("Closed at 16:55", f"{study.closed_at_17:.0%}"),
             ("What if: break-even at +1R", f"{study.breakeven_r:+.2f}R"),
             ("What if: half off at +1R", f"{study.half_off_r:+.2f}R"),
             ("Losses with stop and target in one bar", f"{study.same_bar_losses:.0%}"),
@@ -877,7 +877,7 @@ def _fx_ward(models: dict):
     from tradingagents.dataflows.vendors import oanda
     from tradingagents.fx import agents as fx_agents
     from tradingagents.fx.context import gather
-    from tradingagents.fx.journal import ACTIVE, OPEN, day_close
+    from tradingagents.fx.journal import ACTIVE, OPEN, flat_by
     from tradingagents.fx.manage import snapshot
 
     def ward(now):
@@ -887,7 +887,7 @@ def _fx_ward(models: dict):
         _fx_load_models(models)
         # Calendar and headlines up to when each trade can still be affected.
         horizon = [SimpleNamespace(symbol=p.entry.symbol,
-                                   expires_at=day_close(p.entry.filled_at) if p.entry.status == OPEN
+                                   expires_at=flat_by(p.entry.filled_at) if p.entry.status == OPEN
                                    else p.entry.expires_at) for p in positions]
         context = gather(horizon, now)
         outcome = fx_agents.check_trades(positions, context, models["quick"], models["deep"], now=now)
