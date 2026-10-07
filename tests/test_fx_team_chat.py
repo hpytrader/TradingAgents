@@ -153,3 +153,16 @@ def test_the_watcher_saves_each_review_and_links_its_orders(tmp_path):
     h.run(WATCH_NOW)
     saved = h.book.reviews()
     assert len(saved) == 1 and h.book.entries()[0].review_id == saved[0]["id"]
+
+
+@pytest.mark.unit
+def test_happy_people_shows_the_pipeline_and_every_agent_at_a_desk():
+    page = dashboard.render([], stats([]), now=NOW)
+    assert "<title>Happy People</title>" in page and "<h1>Happy People</h1>" in page
+    for stage in ("scan", "macro", "debate", "verdict", "risk", "book", "fills"):
+        assert f'data-stage="{stage}"' in page
+    for key in ("macro", "price_action", "bull", "bear", "research_manager", "trader", "risk_aggressive",
+                "risk_neutral", "risk_conservative", "trade_manager", "portfolio_manager"):
+        assert f'data-agent="{key}"' in page
+    assert 'id="replay"' in page and "desk boss" in page                 # Donna's corner desk
+    assert page.index('class="floor"') < page.index('id="chat"')
