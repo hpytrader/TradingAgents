@@ -20,7 +20,7 @@ from __future__ import annotations
 import contextlib
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import requests
@@ -141,16 +141,9 @@ def _candles_json(instrument: str, granularity: str, count: int, price: str) -> 
     return data.get("candles") or []
 
 
-def get_candles(symbol: str, granularity: str = "H1", count: int = 300,
-                include_incomplete: bool = False) -> pd.DataFrame:
-    """Mid-price OHLCV bars, oldest first, indexed by UTC bar open time.
-
-    The still-forming bar is dropped unless ``include_incomplete``: a level or
-    an indicator read off a bar that has not closed changes until it does.
-    """
-    instrument = to_oanda_instrument(symbol)
+def _frame(candles: list[dict], include_incomplete: bool = False) -> pd.DataFrame:
     rows = []
-    for candle in _candles_json(instrument, granularity, count, "M"):
+    for candle in candles:
         if not include_incomplete and not candle.get("complete", False):
             continue
         mid = candle.get("mid") or {}
@@ -165,11 +158,56 @@ def get_candles(symbol: str, granularity: str = "H1", count: int = 300,
             })
         except (KeyError, TypeError, ValueError):
             continue
-    if not rows:
-        raise NoMarketDataError(symbol, instrument, f"no {granularity} candles from OANDA")
-    frame = pd.DataFrame(rows)
+    frame = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
     frame["time"] = pd.to_datetime(frame["time"], utc=True)
     return frame.set_index("time").sort_index()
+
+
+def get_candles(symbol: str, granularity: str = "H1", count: int = 300,
+                include_incomplete: bool = False) -> pd.DataFrame:
+    """Mid-price OHLCV bars, oldest first, indexed by UTC bar open time.
+
+    The still-forming bar is dropped unless ``include_incomplete``: a level or
+    an indicator read off a bar that has not closed changes until it does.
+    """
+    instrument = to_oanda_instrument(symbol)
+    frame = _frame(_candles_json(instrument, granularity, count, "M"), include_incomplete)
+    if frame.empty:
+        raise NoMarketDataError(symbol, instrument, f"no {granularity} candles from OANDA")
+    return frame
+
+
+def get_candle_history(symbol: str, granularity: str, start: datetime, end: datetime,
+                       progress=None) -> pd.DataFrame:
+    """Every complete mid-price bar from ``start`` to ``end`` (UTC), fetched 5,000 at a time.
+
+    For backtests: OANDA serves years of history to any account, including a
+    free practice one. ``progress`` is called with each page's last bar time.
+    """
+    if granularity not in GRANULARITIES:
+        raise ValueError(f"Unsupported granularity {granularity!r}")
+    instrument = to_oanda_instrument(symbol)
+    frames, cursor = [], start
+    while cursor < end:
+        data = _get(f"/v3/instruments/{instrument}/candles",
+                    {"granularity": granularity, "price": "M", "count": MAX_COUNT,
+                     "from": cursor.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                     "includeFirst": "true"})
+        page = _frame(data.get("candles") or [])
+        page = page[page.index < pd.Timestamp(end)]
+        if page.empty:
+            break
+        frames.append(page)
+        last = page.index[-1].to_pydatetime()
+        if progress:
+            progress(last)
+        if last <= cursor:
+            break
+        cursor = last + timedelta(seconds=1)
+    if not frames:
+        return _frame([])
+    out = pd.concat(frames)
+    return out[~out.index.duplicated(keep="last")].sort_index()
 
 
 def get_quote(symbol: str) -> Quote:
