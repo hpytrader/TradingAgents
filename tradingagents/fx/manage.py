@@ -24,7 +24,7 @@ from datetime import datetime
 import pandas as pd
 
 from tradingagents.fx.instruments import spec_for
-from tradingagents.fx.journal import OPEN, PENDING, Entry, Journal, day_close
+from tradingagents.fx.journal import OPEN, PENDING, Entry, Journal, flat_by
 
 CandleFetcher = Callable[[str, str, int], pd.DataFrame]
 QuoteFetcher = Callable[[str], object]
@@ -72,7 +72,7 @@ def snapshot(entries: list[Entry], candles: CandleFetcher, quote: QuoteFetcher,
                 hi, lo = float(bars["high"].max()), float(bars["low"].min())
                 best = round(((hi if e.long else lo) - e.entry) * sign / risk, 2)
                 worst = round(((lo if e.long else hi) - e.entry) * sign / risk, 2)
-            since, until = e.filled_at, day_close(e.filled_at)
+            since, until = e.filled_at, flat_by(e.filled_at)
         else:
             since, until = e.created_at, e.expires_at
         out.append(Position(entry=e, mid=mid, spread=max(ask - bid, 0.0), r_now=r_now, best_r=best,

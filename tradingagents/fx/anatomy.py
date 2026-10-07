@@ -77,7 +77,7 @@ def _what_if(e: Entry, bars: pd.DataFrame, half: bool) -> float:
     one_r = e.entry + sign * risk
     moved = False
     banked = 0.0
-    deadline = jr.day_close(e.filled_at)
+    deadline = jr.flat_by(e.filled_at)
 
     def net(price: float) -> float:
         move = (price - e.entry) * sign
@@ -106,7 +106,7 @@ def _what_if(e: Entry, bars: pd.DataFrame, half: bool) -> float:
 
 def measure(e: Entry, m5: pd.DataFrame) -> Path:
     sign = 1 if e.long else -1
-    end = e.exit_at or jr.day_close(e.filled_at)
+    end = e.exit_at or jr.flat_by(e.filled_at)
     held = _bars(m5, e.filled_at, end)
     # a loser's last bar holds the stop: its high (low) may have come after it, so leave it out
     before = held.iloc[:-1] if e.status == jr.LOST and len(held) > 1 else held
@@ -120,11 +120,11 @@ def measure(e: Entry, m5: pd.DataFrame) -> Path:
         mae = float((before["high"].max() - e.entry) / e.risk)
     after_stop = False
     if e.status == jr.LOST and e.exit_at is not None:
-        later = _bars(m5, e.exit_at + timedelta(minutes=5), jr.day_close(e.filled_at))
+        later = _bars(m5, e.exit_at + timedelta(minutes=5), jr.flat_by(e.filled_at))
         if not later.empty:
             best = later["high"].max() if e.long else later["low"].min()
             after_stop = bool((best - e.target) * sign >= 0)
-    path = _bars(m5, e.filled_at, jr.day_close(e.filled_at))
+    path = _bars(m5, e.filled_at, jr.flat_by(e.filled_at))
     return Path(ticket=e.ticket, symbol=e.symbol, status=e.status, net_r=float(e.result_r),
                 gross_r=round(_gross(e), 3), spread_share=round(e.spread / e.risk, 3),
                 mfe=round(max(mfe, 0.0), 2), mae=round(max(mae, 0.0), 2),
@@ -238,7 +238,7 @@ def to_markdown(a: Anatomy, period: str) -> str:
         ("Result per trade, before the spread", f"{a.gross_r:+.2f}R"),
         ("Spread as a share of the risk", f"{a.spread_share:.0%}"),
         ("Win rate", f"{a.win_rate:.0%}"),
-        ("Closed at the 17:00 close", f"{a.closed_at_17:.0%}"),
+        ("Closed at 16:55", f"{a.closed_at_17:.0%}"),
         ("Losers stopped within 15 / 60 minutes", f"{a.stopped_within_15:.0%} / {a.stopped_within_60:.0%}"),
         ("Losers that reached the target after the stop", f"{a.target_after_stop:.0%}"),
         ("What if: break-even at +1R", f"{a.breakeven_r:+.2f}R a trade"),

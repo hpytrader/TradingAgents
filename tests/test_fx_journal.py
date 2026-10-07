@@ -80,7 +80,7 @@ def test_an_open_trade_closes_at_the_new_york_close():
     drift = (1.1720, 1.1722, 1.1718, 1.1720)
     bars = _bars(fill, *[drift] * 2000)                       # past 17:00 New York (21:00 UTC)
     e = simulate(_entry(expires_at=T0 + timedelta(hours=12)), bars, T0 + timedelta(hours=34))
-    assert e.status == jr.CLOSED and e.exit_at == datetime(2026, 10, 6, 21, 0, tzinfo=UTC)
+    assert e.status == jr.CLOSED and e.exit_at == datetime(2026, 10, 6, 20, 55, tzinfo=UTC)   # 16:55 New York
     assert e.result_r == pytest.approx(1.0)                   # +20 pips on 20 risk
 
 
@@ -91,6 +91,13 @@ def test_shorts_mirror_longs_and_the_spread_is_charged():
              T0 + timedelta(hours=1))
     assert e.status == jr.WON
     assert e.result_r == pytest.approx((0.0050 - 0.0002) / (0.0020 + 0.0002), abs=0.01)
+
+
+@pytest.mark.unit
+def test_trades_are_flat_five_minutes_before_the_close():
+    from tradingagents.fx.journal import flat_by
+    assert flat_by(datetime(2026, 10, 6, 14, 0, tzinfo=UTC)) == datetime(2026, 10, 6, 20, 55, tzinfo=UTC)
+    assert flat_by(datetime(2026, 11, 3, 14, 0, tzinfo=UTC)) == datetime(2026, 11, 3, 21, 55, tzinfo=UTC)   # winter
 
 
 @pytest.mark.unit

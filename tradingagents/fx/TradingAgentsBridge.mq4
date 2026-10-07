@@ -14,7 +14,7 @@
 //|  - it never holds more than MaxOpenOrders of its own orders;     |
 //|  - it ignores an instruction older than its valid_until time;    |
 //|  - it deletes each pending order at its cancel time and closes   |
-//|    each filled trade at its close time (17:00 New York), both    |
+//|    each filled trade at its close time (16:55 New York), both    |
 //|    remembered in ta_book.txt so a restart keeps them.            |
 //+------------------------------------------------------------------+
 #property strict
