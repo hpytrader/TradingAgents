@@ -71,6 +71,8 @@ class Experiment:
     target_r: float | None = None           # bring a farther target in to this many R
     symbols: tuple[str, ...] = ()           # empty: every instrument
     skip_wide_spread: bool = False
+    stop_mult: float = 1.0                  # widen the stop to this many times its distance (target kept)
+    manage: str | None = None               # "breakeven" or "half_off" once the trade is +1R
 
     def admits(self, s: Setup, t: datetime) -> bool:
         f = s.features or {}
@@ -92,16 +94,21 @@ class Experiment:
         return not (self.skip_wide_spread and f.get("wide_spread"))
 
     def adjust(self, s: Setup) -> Setup:
-        """Bring the target in to ``target_r`` R when it is farther than that."""
+        """Widen the stop (``stop_mult``), then bring a far target in to ``target_r`` R."""
+        sign = 1 if s.direction == "long" else -1
+        spec = spec_for(s.symbol)
+        spread = s.spread_pips * spec.pip
+        if self.stop_mult != 1.0:
+            wider = abs(s.entry - s.stop) * self.stop_mult
+            reward = abs(s.target - s.entry)
+            s = replace(s, stop=spec.round_price(s.entry - sign * wider), risk_pips=round(spec.pips(wider), 1),
+                        rr=round((reward - spread) / (wider + spread), 2))
         if self.target_r is None:
             return s
         risk = abs(s.entry - s.stop)
-        sign = 1 if s.direction == "long" else -1
         nearer = s.entry + sign * self.target_r * risk
         if (nearer - s.target) * sign >= 0:          # the scanner's target is already nearer
             return s
-        spec = spec_for(s.symbol)
-        spread = s.spread_pips * spec.pip
         reward = abs(nearer - s.entry)
         return replace(s, target=spec.round_price(nearer), reward_pips=round(spec.pips(reward), 1),
                        rr=round((reward - spread) / (risk + spread), 2), target_kind=f"{self.target_r:g}R")
@@ -132,6 +139,12 @@ class Experiment:
             rules.append("only " + ", ".join(self.symbols))
         if self.skip_wide_spread:
             rules.append("no wide-spread setups")
+        if self.stop_mult != 1.0:
+            rules.append(f"stops {self.stop_mult:g}x as far, same targets")
+        if self.manage == "breakeven":
+            rules.append("stop to break-even at +1R")
+        elif self.manage == "half_off":
+            rules.append("half off at +1R, the rest to break-even")
         return "; ".join(rules) or "the unchanged rules"
 
 
@@ -300,6 +313,38 @@ FIRST_BATCH: tuple[Experiment, ...] = (
         "both ways; the sweep before it is rarely the final one.",
         skip_hours=(8,)),
 )
+
+
+SECOND_BATCH: tuple[Experiment, ...] = (
+    Experiment(
+        "wider-stops-1.5x",
+        "The anatomy found 22% of losers stopped and then reaching the target the same day, half of them "
+        "within an hour: the stop sits where the next sweep goes. A stop half as far again survives that "
+        "sweep; each win pays less R, but more trades should reach the target.",
+        stop_mult=1.5),
+    Experiment(
+        "wider-stops-2x",
+        "The same reason as wider-stops-1.5x, further: 39% of winners went 0.5R against us first, so price "
+        "routinely trades through the first stop distance before the move.",
+        stop_mult=2.0),
+    Experiment(
+        "half-off-at-1r",
+        "32% of losers were +1R up before turning into a full loss. Banking half there and moving the rest "
+        "to break-even keeps part of those moves.",
+        manage="half_off"),
+    Experiment(
+        "breakeven-at-1r",
+        "The same evidence as half-off-at-1r, keeping the whole position for the target but never letting "
+        "a +1R trade become a full loss.",
+        manage="breakeven"),
+    Experiment(
+        "wider-stop-and-half-off",
+        "Both leaks at once: a stop that survives the next sweep, and half banked at +1R so the wider "
+        "stop's smaller R per win is not given back.",
+        stop_mult=1.5, manage="half_off"),
+)
+
+BATCHES = {1: FIRST_BATCH, 2: SECOND_BATCH}
 
 
 def report(rows: list[dict], base_design: Result, base_locked: Result | None, ledger: Ledger) -> str:
