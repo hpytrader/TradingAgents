@@ -46,6 +46,54 @@ STALE_AFTER = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
+class Timeframes:
+    """Which charts the model reads, and the limits that depend on them.
+
+    ``m5`` is the desk's model: 1-hour bias, 5-minute sweep and entry. ``m15``
+    is the same model a step up: 4-hour bias, 15-minute sweep and entry, so
+    stops and targets are three to four times larger and the spread a smaller
+    share of each trade. The ATR limits are in the bias chart's ATR.
+    """
+
+    name: str
+    bias: str                      # granularity of the bias chart
+    entry: str                     # granularity of the sweep, shift and entry
+    bias_bars: int
+    entry_bars: int
+    day_bars: int                  # entry bars in 24 hours
+    sweep_lookback: int            # entry bars searched for a sweep
+    choch_within: int              # entry bars after the sweep for the shift to come
+    max_shift_age: timedelta
+    stale_after: timedelta
+    min_risk_atr: float            # MIN_RISK_H1_ATR, in bias ATRs
+    max_entry_atr: float           # MAX_ENTRY_H1_ATR, in bias ATRs
+    max_target_atr: float          # MAX_TARGET_H1_ATR, in bias ATRs
+    bias_label: str = "1h"
+    entry_label: str = "5m"
+
+
+def _desk() -> Timeframes:
+    """The desk's 1-hour / 5-minute model, read from the module's limits each time."""
+    return Timeframes("m5", "H1", "M5", H1_BARS, M5_BARS, 288, SWEEP_LOOKBACK, CHOCH_WITHIN, MAX_SHIFT_AGE,
+                      STALE_AFTER, MIN_RISK_H1_ATR, MAX_ENTRY_H1_ATR, MAX_TARGET_H1_ATR)
+
+
+# a 4-hour ATR is about twice an hourly one: the limits keep the same distances in hourly terms,
+# except the target, which may run a little further for the bigger structure
+HTF = Timeframes("m15", "H4", "M15", 300, 600, 96, 48, 24, timedelta(hours=4), timedelta(minutes=45),
+                 0.35, 1.0, 2.0, "4h", "15m")
+
+
+def profile(name: str) -> Timeframes:
+    """``m5`` (the desk's model) or ``m15`` (4-hour bias, 15-minute entries)."""
+    if name == "m5":
+        return _desk()
+    if name == "m15":
+        return HTF
+    raise ValueError(f"unknown timeframe profile {name!r}: use m5 or m15")
+
+
+@dataclass(frozen=True)
 class ScanWindow:
     """The hours setups are built in, on New York time (also Toronto time).
 
@@ -171,6 +219,7 @@ def scan_smc(
     any_session: bool = False,
     latest_cancel: time = LATEST_CANCEL,
     now: datetime | None = None,
+    timeframes: Timeframes | None = None,
 ) -> ScanResult:
     """Scan ``symbols`` for SMC setups and return the best per instrument, ranked.
 
@@ -198,7 +247,7 @@ def scan_smc(
             skipped.append((symbol, str(exc)))
             continue
         try:
-            found = _setup(spec, candles, quote, now, min_rr, expires, session_name)
+            found = _setup(spec, candles, quote, now, min_rr, expires, session_name, timeframes or _desk())
         except Exception as exc:  # one pair's data problem must not end the scan
             skipped.append((spec.symbol, f"data unavailable: {exc}"))
             continue
@@ -210,17 +259,18 @@ def scan_smc(
 
 
 def _setup(spec: InstrumentSpec, candles: CandleFetcher, quote: QuoteFetcher, now: datetime,
-           min_rr: float, expires: datetime, session_name: str) -> Setup | str:
-    h1 = candles(spec.symbol, "H1", H1_BARS)
-    m5 = candles(spec.symbol, "M5", M5_BARS)
+           min_rr: float, expires: datetime, session_name: str, tf: Timeframes) -> Setup | str:
+    # h1/m5 name the bias and entry charts; with the m15 profile they hold 4-hour and 15-minute bars
+    h1 = candles(spec.symbol, tf.bias, tf.bias_bars)
+    m5 = candles(spec.symbol, tf.entry, tf.entry_bars)
     if len(h1) < 60 or len(m5) < 120:
         return "not enough price history"
-    if now - m5.index[-1].to_pydatetime() > STALE_AFTER:
+    if now - m5.index[-1].to_pydatetime() > tf.stale_after:
         return "no recent prices (market closed?)"
 
     direction_bias, h1_break = smc.bias(h1)
     if direction_bias is None:
-        return "no clear 1-hour structure"
+        return f"no clear {tf.bias_label} structure"
     long = direction_bias == "long"
     up = "up" if long else "down"
     atr5, atr1 = smc.atr(m5), smc.atr(h1)
@@ -231,23 +281,24 @@ def _setup(spec: InstrumentSpec, candles: CandleFetcher, quote: QuoteFetcher, no
     bid, ask = float(q.bid), float(q.ask)
     mid, spread = (bid + ask) / 2, max(ask - bid, 0.0)
 
-    liquidity = smc.pools(m5, now, atr5)
-    since = len(m5) - SWEEP_LOOKBACK
+    liquidity = smc.pools(m5, now, atr5, day_bars=tf.day_bars)
+    since = len(m5) - tf.sweep_lookback
     taken = smc.sweeps(m5, liquidity, "low" if long else "high", since)
     if not taken:
         side = "sell-side (lows)" if long else "buy-side (highs)"
-        return f"1h bias {direction_bias}, but no {side} liquidity swept in the last 6 hours"
+        return f"{tf.bias_label} bias {direction_bias}, but no {side} liquidity swept in the last " \
+               f"{tf.sweep_lookback * (5 if tf.entry == 'M5' else 15) // 60} hours"
 
     m5_breaks = smc.breaks(m5)
     candidates: list[Setup] = []
-    reason = f"liquidity swept, but no 5-minute change of character {up} followed"
+    reason = f"liquidity swept, but no {tf.entry_label} change of character {up} followed"
     for sweep in sorted(taken, key=lambda s: s.i, reverse=True):
         shift = next((b for b in m5_breaks
-                      if b.direction == up and sweep.i < b.i <= sweep.i + CHOCH_WITHIN), None)
+                      if b.direction == up and sweep.i < b.i <= sweep.i + tf.choch_within), None)
         if shift is None:
             continue
         built = _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
-                            atr5, atr1, min_rr, h1_break, now, expires, session_name)
+                            atr5, atr1, min_rr, h1_break, now, expires, session_name, tf)
         if isinstance(built, Setup):
             candidates.append(built)
         else:
@@ -258,11 +309,12 @@ def _setup(spec: InstrumentSpec, candles: CandleFetcher, quote: QuoteFetcher, no
 
 
 def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
-                atr5, atr1, min_rr, h1_break, now, expires, session_name) -> Setup | str:
+                atr5, atr1, min_rr, h1_break, now, expires, session_name, tf=None) -> Setup | str:
+    tf = tf or _desk()
     up = "up" if long else "down"
     sign = 1 if long else -1
     age = now - m5.index[shift.i].to_pydatetime()
-    if age > MAX_SHIFT_AGE:
+    if age > tf.max_shift_age:
         hours = age.total_seconds() / 3600
         return (f"the structure shift at {m5.index[shift.i]:%H:%M} UTC is {hours:.1f}h old; "
                 "the move has most likely played out")
@@ -304,22 +356,22 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         return f"every {kinds} from the move has already been traded back into"
 
     entry = zone.mid
-    if abs(mid - entry) > MAX_ENTRY_H1_ATR * atr1:
+    if abs(mid - entry) > tf.max_entry_atr * atr1:
         return (f"the {zone.kind} is {abs(mid - entry) / atr1:.1f}× the hourly range from price; "
                 "a limit there is unlikely to fill this session")
     buffer = max(3 * spread, 0.3 * atr5)
     stop = extreme - sign * buffer
     widened = False
-    if abs(entry - stop) < MIN_RISK_H1_ATR * atr1:
+    if abs(entry - stop) < tf.min_risk_atr * atr1:
         # In a quiet market the sweep wick can sit almost on the entry; a stop
         # a pip away is noise, not invalidation. Keep it beyond the sweep, but
         # never closer than a fraction of the hourly range.
-        stop = entry - sign * MIN_RISK_H1_ATR * atr1
+        stop = entry - sign * tf.min_risk_atr * atr1
         widened = True
     risk = abs(entry - stop)
 
     target, target_name = _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5,
-                                  after_i=shift.i)
+                                  after_i=shift.i, max_target_atr=tf.max_target_atr, bias_label=tf.bias_label)
     if target is None:
         return target_name
     reward = abs(target - entry)
@@ -331,7 +383,7 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
     minutes = (now - m5.index[shift.i].to_pydatetime()).total_seconds() / 60
 
     score, reasons = _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth,
-                            rr, minutes, spread, atr5, target_name, long, m5)
+                            rr, minutes, spread, atr5, target_name, long, m5, tf.bias_label, tf.entry_label)
     return Setup(
         symbol=spec.symbol,
         direction="long" if long else "short",
@@ -348,8 +400,8 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         target_kind=target_name,
         expires_at=expires,
         reasons=reasons
-        + ([f"stop widened to the minimum {MIN_RISK_H1_ATR}× 1h ATR "
-            f"({spec.pips(MIN_RISK_H1_ATR * atr1):.1f} pips); the sweep wick sat too close to the entry"]
+        + ([f"stop widened to the minimum {tf.min_risk_atr}× {tf.bias_label} ATR "
+            f"({spec.pips(tf.min_risk_atr * atr1):.1f} pips); the sweep wick sat too close to the entry"]
            if widened else [])
         + [f"{session_name} session; cancel at {expires:%H:%M} UTC if unfilled"],
         strategy="smc",
@@ -363,7 +415,8 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
     )
 
 
-def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5, after_i=None):
+def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr5, after_i=None,
+            max_target_atr=MAX_TARGET_H1_ATR, bias_label="1h"):
     """Nearest opposing liquidity beyond price paying ``min_rr``: (price, name) or (None, why).
 
     Liquidity price has already traded through since the structure shift
@@ -378,7 +431,7 @@ def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr
     for s in h1_points:
         broken = (closes[s.i + 1:] > s.price).any() if long else (closes[s.i + 1:] < s.price).any()
         if not broken:
-            options.append((s.price, "1h swing high" if long else "1h swing low"))
+            options.append((s.price, f"{bias_label} swing high" if long else f"{bias_label} swing low"))
     beyond = sorted(((lvl, name) for lvl, name in options if (lvl - mid) * sign > 0),
                     key=lambda x: (x[0] - mid) * sign)
     if after_i is not None and beyond:
@@ -391,7 +444,7 @@ def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr
         beyond = fresh
     if not beyond:
         return None, "no opposing liquidity left beyond price to target"
-    limit = MAX_TARGET_H1_ATR * atr1
+    limit = max_target_atr * atr1
     for level, name in beyond:
         target = level - sign * 0.1 * atr5           # exit just before the pool
         if (target - mid) * sign <= spread:
@@ -405,7 +458,7 @@ def _target(m5, h1, liquidity, long, mid, entry, risk, spread, min_rr, atr1, atr
 
 
 def _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth, rr, minutes,
-           spread, atr5, target_name, long, m5):
+           spread, atr5, target_name, long, m5, bias_label="1h", entry_label="5m"):
     reasons = []
     when = m5.index[sweep.i].strftime("%H:%M")
     pool_pts = {3: 25, 2: 20, 1: 15, 0: 10}[sweep.pool.quality]
@@ -413,7 +466,7 @@ def _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth, 
                    f"and closed back {'above' if long else 'below'}")
 
     disp_pts = min(displacement / 3, 1.0) * 20
-    reasons.append(f"5m structure shift ({shift.kind}) {'up' if long else 'down'} at "
+    reasons.append(f"{entry_label} structure shift ({shift.kind}) {'up' if long else 'down'} at "
                    f"{m5.index[shift.i]:%H:%M} UTC through {spec.round_price(shift.level)}, "
                    f"displacement {displacement:.1f}× ATR")
 
@@ -426,7 +479,7 @@ def _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth, 
                    + (" (discount)" if long and depth >= 0.5 else " (premium)" if not long and depth >= 0.5 else ""))
 
     h1_pts = 10 if h1_break.kind == "BOS" else 5
-    reasons.append(f"1h {h1_break.kind} {h1_break.direction} at {spec.round_price(h1_break.level)} sets the bias")
+    reasons.append(f"{bias_label} {h1_break.kind} {h1_break.direction} at {spec.round_price(h1_break.level)} sets the bias")
 
     rr_pts = min(max(rr - 2, 0) / 2, 1.0) * 10
     reasons.append(f"{rr:.1f}R to the {target_name} after the spread")
@@ -435,6 +488,6 @@ def _score(spec, sweep, shift, h1_break, displacement, confluence, zone, depth, 
 
     penalty = 10 if spread > 0.3 * atr5 else 0
     if penalty:
-        reasons.append(f"wide spread: {spread / atr5:.0%} of the 5-minute range")
+        reasons.append(f"wide spread: {spread / atr5:.0%} of the {entry_label} range")
     total = pool_pts + disp_pts + conf_pts + depth_pts + h1_pts + rr_pts + fresh_pts - penalty
     return max(total, 0.0), reasons

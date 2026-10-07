@@ -50,8 +50,16 @@ TYPICAL_SPREAD_PIPS = {
     "XAUUSD": 3.5, "XAGUSD": 2.5,
 }
 BAR_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D": 86400}
-GRANULARITIES = ("M5", "H1")
+GRANULARITIES = ("M5", "H1")           # the desk's model; settling always uses M5
+
+
+def granularities(timeframe: str = "m5") -> tuple[str, ...]:
+    """The bars a replay needs: the model's two charts, and five-minute bars to settle on."""
+    from tradingagents.fx.smc_scanner import profile
+    tf = profile(timeframe)
+    return tuple(dict.fromkeys(("M5", tf.bias, tf.entry)))
 WARMUP = timedelta(days=30)          # the scanner reads 300 hourly bars back from its first scan
+WARMUPS = {"m5": WARMUP, "m15": timedelta(days=80)}   # 300 four-hour bars need about 75 days
 
 Fetch = Callable[[str, str, datetime, datetime], pd.DataFrame]
 
@@ -159,6 +167,7 @@ class Rules:
     max_per_currency: int = 2
     window: ScanWindow = field(default_factory=ScanWindow)
     latest_cancel: time = LATEST_CANCEL
+    timeframe: str = "m5"                  # "m5": 1h bias, 5m entries; "m15": 4h bias, 15m entries
 
 
 def scan_times(start: datetime, end: datetime, rules: Rules) -> Iterable[datetime]:
@@ -192,7 +201,9 @@ def scan_log(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end:
              rules: Rules | None = None, progress: Callable[[datetime, int], None] | None = None) -> ScanLog:
     """What the scanner offered at every scan from ``start`` to ``end``: the slow part, done once."""
     rules = rules or Rules()
-    symbols = [s for s in symbols if (s, "M5") in feed.frames and (s, "H1") in feed.frames]
+    from tradingagents.fx.smc_scanner import profile
+    tf = profile(rules.timeframe)
+    symbols = [s for s in symbols if all((s, g) in feed.frames for g in granularities(rules.timeframe))]
     log: ScanLog = []
     found = 0
     for t in scan_times(start, end, rules):
@@ -201,7 +212,7 @@ def scan_log(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end:
         feed.now = t
         result = scan_smc(feed.candles, feed.quote, symbols, min_rr=rules.min_rr, top=rules.final + 4,
                           max_per_currency=rules.max_per_currency + 1, window=rules.window, now=t,
-                          latest_cancel=rules.latest_cancel)
+                          latest_cancel=rules.latest_cancel, timeframes=tf)
         log.append((t, result.setups))
         found += len(result.setups)
         if progress:
@@ -296,7 +307,7 @@ def log_key(symbols: Iterable[str], start: datetime, end: datetime, rules: Rules
     from tradingagents.fx import smc, smc_scanner
     code = "".join(Path(m.__file__).read_text(encoding="utf-8") for m in (smc, smc_scanner))
     raw = f"{sorted(symbols)}|{start:%Y%m%d}|{end:%Y%m%d}|{rules.step_minutes}|{rules.min_rr}|{rules.final}|" \
-          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{code}"
+          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{rules.timeframe}|{code}"
     return f"{start:%Y%m%d}-{end:%Y%m%d}-{hashlib.sha1(raw.encode()).hexdigest()[:10]}"
 
 

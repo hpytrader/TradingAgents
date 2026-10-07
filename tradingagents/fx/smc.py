@@ -175,8 +175,8 @@ def _session_range(frame: pd.DataFrame, tz, start: time, end: time,
     return float(part["low"].min()), float(part["high"].max()), last
 
 
-def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2) -> list[Pool]:
-    """Liquidity pools visible at ``now`` on an intraday frame (M5)."""
+def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2, day_bars: int = 288) -> list[Pool]:
+    """Liquidity pools visible at ``now`` on an intraday frame (``day_bars`` bars a day: 288 on M5)."""
     out: list[Pool] = []
     if frame.empty:
         return out
@@ -202,7 +202,7 @@ def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2) -> list
         out.append(Pool("London high", london[1], "high", 2, london[2]))
 
     tolerance = 0.15 * atr
-    offset = max(len(frame) - 288, 0)
+    offset = max(len(frame) - day_bars, 0)
     recent = swings(frame.iloc[offset:], wing)
     for kind, side, name in (("low", "low", "equal lows"), ("high", "high", "equal highs")):
         points = [s for s in recent if s.kind == kind]
@@ -220,7 +220,7 @@ def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2) -> list
 
     # Single swing points of the last twelve hours: the stops a swing failure
     # pattern (SFP) runs. Only those not already covered by a stronger pool.
-    near = max(len(frame) - 144, 0)
+    near = max(len(frame) - day_bars // 2, 0)
     for s in swings(frame.iloc[near:], wing):
         side = s.kind
         if all(abs(s.price - p.level) > tolerance for p in out if p.side == side):

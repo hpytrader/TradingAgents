@@ -168,3 +168,26 @@ def test_the_report_grades_against_the_benchmarks_and_needs_enough_trades():
     losing = _finished([-1.0] * 150 + [2.0] * 30)
     assert lab.summarize(losing, MON, MON + timedelta(days=200), ["EURUSD"], lab.Rules()).verdict.startswith(
         "No edge")
+
+
+@pytest.mark.unit
+def test_the_higher_timeframe_model_reads_four_hour_and_fifteen_minute_bars(monkeypatch):
+    from tradingagents.fx import smc_scanner
+    asked = []
+
+    def candles(symbol, gran, count):
+        asked.append((gran, count))
+        return _bars(MON - timedelta(days=60), 10, freq="15min")       # too short: the scan stops early
+
+    q = lambda s: lab._Quote(s, 1.1699, 1.1701, MON)                     # noqa: E731
+    smc_scanner.scan_smc(candles, q, ["EURUSD"], now=MON, timeframes=smc_scanner.profile("m15"))
+    assert asked == [("H4", 300), ("M15", 600)]
+    asked.clear()
+    smc_scanner.scan_smc(candles, q, ["EURUSD"], now=MON)
+    assert asked == [("H1", 300), ("M5", 600)]                          # the desk's model is unchanged
+    assert lab.granularities("m15") == ("M5", "H4", "M15") and lab.granularities("m5") == ("M5", "H1")
+    k5 = lab.log_key(["EURUSD"], MON, MON + timedelta(days=1), lab.Rules())
+    k15 = lab.log_key(["EURUSD"], MON, MON + timedelta(days=1), lab.Rules(timeframe="m15"))
+    assert k5 != k15
+    with pytest.raises(ValueError):
+        smc_scanner.profile("m1")
