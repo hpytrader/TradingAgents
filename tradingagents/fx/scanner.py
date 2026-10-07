@@ -77,6 +77,7 @@ class Setup:
     zone_low: float | None = None      # smc: the order block / FVG the entry sits in
     zone_high: float | None = None
     invalidation: float | None = None  # smc: the sweep extreme the stop must stay beyond
+    features: dict = field(default_factory=dict)   # smc: what the setup is made of, for the lab
 
     @property
     def order_type(self) -> str:
