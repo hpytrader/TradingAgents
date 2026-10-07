@@ -507,7 +507,7 @@ def fx_watch(
                 parts.append(f"{ward_name} checked the live trades")
             parts += c.notes
             if bridge is not None:
-                parts += _fx_bridge_sync(bridge, now, notify)
+                parts += _fx_bridge_sync(bridge, datetime.now(UTC), notify)   # the cycle may have taken minutes
             console.print(" · ".join(parts))
             entries = book.entries()
             dashboard.write(page, entries, stats(entries), now=now, live=True, window=scan_window,

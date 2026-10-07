@@ -215,15 +215,18 @@ def test_gold_maps_to_the_brokers_name_and_wrong_prices_are_refused(desk):
 
 
 @pytest.mark.unit
-def test_an_unanswered_order_is_given_up_and_reported(desk):
+def test_an_unanswered_order_is_reported_and_sent_again_then_given_up(desk):
     desk.book.record([_order()], now=NOW, tickets={"EURUSD": "#1043"})
     desk.sync()
-    later = NOW + timedelta(minutes=4)
-    desk.ea.time = later
-    desk.ea.write_state()
-    desk.sync(later)
+    later = NOW
+    for _ in range(4):                                                 # MT4 never answers
+        later += timedelta(minutes=4)
+        desk.ea.time = later
+        desk.ea.write_state()
+        desk.sync(later)
+    assert sum(": MT4 did not answer" in m for m in desk.sent) == 4     # the first send and three retries
+    assert any("gave up" in m for m in desk.sent)
     assert desk.bridge.rows()["#1043"].state == "failed"
-    assert any("did not answer" in m for m in desk.sent)
 
 
 @pytest.mark.unit
@@ -311,3 +314,52 @@ def test_a_test_order_reports_a_refusal(desk):
     lines = desk.bridge.test_order("EURUSD", NOW, sleep=refuse)
     assert "REFUSED by MT4: trade is disabled (error 133)" in lines[-1]
     assert "No price" in desk.bridge.test_order("USDJPY", NOW, sleep=refuse)[0]
+
+
+@pytest.mark.unit
+def test_an_order_that_reached_mt4_late_is_sent_again(desk):
+    desk.book.record([_order()], now=NOW, tickets={"EURUSD": "#1043"})
+    desk.sync()
+    [path] = desk.ea.dir.glob("ta_cmd_*.txt")                          # MT4 answers it as stale
+    cmd = mt4._kv(path.read_text())
+    path.unlink()
+    (desk.ea.dir / f"ta_res_{cmd['id']}.txt").write_text(
+        f"id={cmd['id']}\r\nok=0\r\nmt4=0\r\nerror=0\r\nmessage=stale instruction, ignored\r\n")
+    desk.sync()
+    assert any("reached MT4 late" in m for m in desk.sent)
+    assert not any("refused" in m for m in desk.sent)
+    desk.sync()                                                        # sent again, and placed
+    desk.ea.run()
+    desk.sync()
+    assert desk.bridge.rows()["#1043"].state == "pending"
+    assert any("placed" in m for m in desk.sent)
+
+
+@pytest.mark.unit
+def test_an_order_mt4_refused_is_not_sent_again(desk):
+    desk.book.record([_order()], now=NOW, tickets={"EURUSD": "#1043"})
+    desk.sync()
+    [path] = desk.ea.dir.glob("ta_cmd_*.txt")
+    cmd = mt4._kv(path.read_text())
+    path.unlink()
+    (desk.ea.dir / f"ta_res_{cmd['id']}.txt").write_text(
+        f"id={cmd['id']}\r\nok=0\r\nmt4=0\r\nerror=134\r\nmessage=not enough money\r\n")
+    for _ in range(3):
+        desk.sync()
+    assert not list(desk.ea.dir.glob("ta_cmd_*.txt"))
+    assert desk.bridge.rows()["#1043"].state == "failed"
+
+
+@pytest.mark.unit
+def test_a_late_order_is_retried_at_most_three_times(desk):
+    desk.book.record([_order()], now=NOW, tickets={"EURUSD": "#1043"})
+    sends = 0
+    for _ in range(6):
+        desk.sync()
+        for path in desk.ea.dir.glob("ta_cmd_*.txt"):
+            sends += 1
+            cmd = mt4._kv(path.read_text())
+            path.unlink()
+            (desk.ea.dir / f"ta_res_{cmd['id']}.txt").write_text(
+                f"id={cmd['id']}\r\nok=0\r\nmt4=0\r\nerror=0\r\nmessage=stale instruction, ignored\r\n")
+    assert sends == 4                                                  # the first send and three retries
