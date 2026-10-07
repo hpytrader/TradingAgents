@@ -242,3 +242,19 @@ def test_fx_telegram_command_guides_setup(monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     out = CliRunner().invoke(app, ["fx-telegram"]).output
     assert "@BotFather" in out and "TELEGRAM_BOT_TOKEN" in out
+
+
+@pytest.mark.unit
+def test_a_setup_already_on_the_book_is_not_reviewed_again(tmp_path):
+    h = Harness(tmp_path, [_setup()])
+    assert h.run(NOW).reviewed                                    # EURUSD long is now pending
+    h.setups[:] = [_setup(zone=(1.1696, 1.1706))]                 # same idea, zone shifted a little
+    again = h.run(NOW + timedelta(minutes=10))
+    assert not again.reviewed and again.candidates == 0 and h.reviews == 1
+
+    h.setups.append(_setup("GBPUSD"))                             # a new idea alongside it
+    seen = []
+    h.review = lambda result, now: (seen.append([s.symbol for s in result.setups]),
+                                    Harness.review(h, result, now))[1]
+    assert h.run(NOW + timedelta(minutes=20)).reviewed
+    assert seen == [["GBPUSD"]]                                   # the desk only sees the new one
