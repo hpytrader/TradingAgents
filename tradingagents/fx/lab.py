@@ -219,39 +219,52 @@ def trade(log: ScanLog, feed: HistoricalFeed, end: datetime, rules: Rules | None
     """
     rules = rules or Rules()
     entries: list[Entry] = []
+    live: list[tuple[datetime, Entry]] = []          # (when its symbol and side are free again, the order)
     seen: set[str] = set()
     seen_day: date | None = None
-
-    def settle(e: Entry, now: datetime) -> None:
-        bars = feed.frames[(e.symbol, "M5")]
-        ends = feed._ends[(e.symbol, "M5")]
-        first = int(np.searchsorted(_ns(bars.index), pd.Timestamp(e.created_at).value, side="left"))
-        k = int(np.searchsorted(ends, pd.Timestamp(now).value, side="right"))
-        jr.simulate(e, bars.iloc[first:k], now)         # only this order's bars: fast over long histories
 
     for t, offered in log:
         day = t.astimezone(NEW_YORK).date()
         if day != seen_day:
             seen, seen_day = set(), day
-        for e in entries:
-            if e.status in jr.ACTIVE:
-                settle(e, t)
+        live = [(free, e) for free, e in live if t < free]
         setups = offered
         if experiment is not None:
             setups = [experiment.adjust(s) for s in offered if experiment.admits(s, t)]
-        on_book = {(e.symbol, e.direction) for e in entries if e.status in jr.ACTIVE}
+        on_book = {(e.symbol, e.direction) for _, e in live}
         fresh = [s for s in setups if (s.symbol, s.direction) not in on_book and setup_key(s) not in seen]
         seen |= {setup_key(s) for s in setups}
         for s in fresh[:rules.final]:
             e = _entry(s, t, len(entries) + 1)
             e.features = {**s.features, "hour": t.astimezone(NEW_YORK).hour, "target_kind": s.target_kind}
+            _settle(feed, e)
             entries.append(e)
+            live.append((_free_from(e), e))
             on_book.add((s.symbol, s.direction))
-
-    for e in entries:                                         # play every order out to its end
-        if e.status in jr.ACTIVE:
-            settle(e, max(end, jr.day_close(e.created_at) + timedelta(minutes=5)))
     return entries
+
+
+def _settle(feed: HistoricalFeed, e: Entry) -> None:
+    """Play an order out to its end at once, on its own bars only.
+
+    The outcome uses bars after the order was placed, as it would live; the
+    replay only asks *when* the order stops occupying its symbol and side
+    (:func:`_free_from`), which it could have seen by then.
+    """
+    bars = feed.frames[(e.symbol, "M5")]
+    first = int(np.searchsorted(_ns(bars.index), pd.Timestamp(e.created_at).value, side="left"))
+    horizon = jr.day_close(e.created_at) + timedelta(minutes=5)
+    last = int(np.searchsorted(_ns(bars.index), pd.Timestamp(horizon).value, side="right"))
+    jr.simulate(e, bars.iloc[first:last], horizon)
+
+
+def _free_from(e: Entry) -> datetime:
+    """When the desk would have seen the order finished: its last bar closed, or its cancel time passed."""
+    if e.status in jr.ACTIVE:                        # the history ends first
+        return datetime.max.replace(tzinfo=UTC)
+    if e.status == jr.EXPIRED:
+        return e.expires_at
+    return (e.exit_at or e.expires_at) + timedelta(minutes=5)
 
 
 def replay(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: datetime,
