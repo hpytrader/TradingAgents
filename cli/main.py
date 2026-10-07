@@ -682,6 +682,7 @@ def fx_lab(
     final: int = typer.Option(6, "--final", help="Most new orders per scan"),
     experiments: bool = typer.Option(False, "--experiments", help="Run Quinn's ideas: design year, then the locked year"),
     batch: int = typer.Option(None, "--batch", help="Which batch of Quinn's ideas to run (default: the newest)"),
+    timeframe: str = typer.Option("m5", "--timeframe", help="m5: 1-hour bias, 5-minute entries (the desk's model); m15: 4-hour bias, 15-minute entries"),
     anatomy: bool = typer.Option(False, "--anatomy", help="Study how the design year's trades played out: costs, stops, exits"),
     refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
     notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
@@ -699,6 +700,10 @@ def fx_lab(
     if months < 1 or step < 1 or final < 1:
         console.print("[red]--months, --step and --final must be at least 1.[/red]")
         raise typer.Exit(code=1)
+    timeframe = timeframe.lower()
+    if timeframe not in lab.WARMUPS:
+        console.print("[red]--timeframe must be m5 or m15.[/red]")
+        raise typer.Exit(code=1)
     names = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
     _require_oanda(names[0])
     end = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -706,20 +711,23 @@ def fx_lab(
     start = end - span
     locked_start = start - span                     # the year before: Quinn's locked test year
     history = lab.History(lab.lab_dir() / "history")
-    rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final)
+    rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final, timeframe=timeframe)
     title = "anatomy" if anatomy else "experiments" if experiments else "baseline"
     console.print(f"[bold]Quinn's lab · {title}[/bold] · design year {start:%d %b %Y} to {end:%d %b %Y}"
                   + (f" · locked year {locked_start:%d %b %Y} to {start:%d %b %Y}" if experiments and not anatomy else "")
-                  + f" · {len(names)} instruments · scans every {step} min, 02:00-12:00 New York")
+                  + f" · {len(names)} instruments · "
+                  + ("4-hour bias, 15-minute entries" if timeframe == "m15" else "1-hour bias, 5-minute entries")
+                  + f" · scans every {step} min, 02:00-12:00 New York")
 
     columns = (TextColumn("{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"),
                TimeRemainingColumn())
-    first = (locked_start if experiments and not anatomy else start) - lab.WARMUP
+    first = (locked_start if experiments and not anatomy else start) - lab.WARMUPS[timeframe]
+    grans = lab.granularities(timeframe)
     frames = {}
     with Progress(*columns, console=console) as bar:
-        job = bar.add_task("Price history", total=len(names) * len(lab.GRANULARITIES))
+        job = bar.add_task("Price history", total=len(names) * len(grans))
         for symbol in names:
-            for gran in lab.GRANULARITIES:
+            for gran in grans:
                 bar.update(job, description=f"Price history · {symbol} {gran}")
                 try:
                     frames[(symbol, gran)] = history.ensure(symbol, gran, first, end,
