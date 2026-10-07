@@ -191,3 +191,10 @@ def test_the_higher_timeframe_model_reads_four_hour_and_fifteen_minute_bars(monk
     assert k5 != k15
     with pytest.raises(ValueError):
         smc_scanner.profile("m1")
+
+
+@pytest.mark.unit
+def test_a_small_positive_result_is_not_called_an_edge():
+    thin = _finished(([1.06, -1.0] * 80) + [1.06] * 4, start=MON - timedelta(days=330))     # about +0.04R
+    r = lab.summarize(thin, MON - timedelta(days=330), MON, ["EURUSD"], lab.Rules())
+    assert r.verdict.startswith("A thin edge that could still be luck") and r.metrics["t_score"] < 2

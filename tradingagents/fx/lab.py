@@ -53,9 +53,11 @@ BAR_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 1
 GRANULARITIES = ("M5", "H1")           # the desk's model; settling always uses M5
 
 
-def granularities(timeframe: str = "m5") -> tuple[str, ...]:
-    """The bars a replay needs: the model's two charts, and five-minute bars to settle on."""
+def granularities(timeframe: str = "m5", model: str = "smc") -> tuple[str, ...]:
+    """The bars a replay needs: the model's charts, and five-minute bars to settle on."""
     from tradingagents.fx.smc_scanner import profile
+    if model == "asian":
+        return ("M5", "H1")
     tf = profile(timeframe)
     return tuple(dict.fromkeys(("M5", tf.bias, tf.entry)))
 WARMUP = timedelta(days=30)          # the scanner reads 300 hourly bars back from its first scan
@@ -168,6 +170,7 @@ class Rules:
     window: ScanWindow = field(default_factory=ScanWindow)
     latest_cancel: time = LATEST_CANCEL
     timeframe: str = "m5"                  # "m5": 1h bias, 5m entries; "m15": 4h bias, 15m entries
+    model: str = "smc"                     # "smc": sweep and reversal; "asian": Asian-range breakout
 
 
 def scan_times(start: datetime, end: datetime, rules: Rules) -> Iterable[datetime]:
@@ -203,14 +206,17 @@ def scan_log(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end:
     rules = rules or Rules()
     from tradingagents.fx.smc_scanner import profile
     tf = profile(rules.timeframe)
-    symbols = [s for s in symbols if all((s, g) in feed.frames for g in granularities(rules.timeframe))]
+    scanner = scan_smc
+    if rules.model == "asian":
+        from tradingagents.fx.asian import scan_asian as scanner
+    symbols = [s for s in symbols if all((s, g) in feed.frames for g in granularities(rules.timeframe, rules.model))]
     log: ScanLog = []
     found = 0
     for t in scan_times(start, end, rules):
         if not market_open(t):
             continue
         feed.now = t
-        result = scan_smc(feed.candles, feed.quote, symbols, min_rr=rules.min_rr, top=rules.final + 4,
+        result = scanner(feed.candles, feed.quote, symbols, min_rr=rules.min_rr, top=rules.final + 4,
                           max_per_currency=rules.max_per_currency + 1, window=rules.window, now=t,
                           latest_cancel=rules.latest_cancel, timeframes=tf)
         log.append((t, result.setups))
@@ -304,10 +310,10 @@ def log_key(symbols: Iterable[str], start: datetime, end: datetime, rules: Rules
     """A name for a cached scan log: changes when the period, rules or scanner code change."""
     import hashlib
 
-    from tradingagents.fx import smc, smc_scanner
-    code = "".join(Path(m.__file__).read_text(encoding="utf-8") for m in (smc, smc_scanner))
+    from tradingagents.fx import asian, smc, smc_scanner
+    code = "".join(Path(m.__file__).read_text(encoding="utf-8") for m in (smc, smc_scanner, asian))
     raw = f"{sorted(symbols)}|{start:%Y%m%d}|{end:%Y%m%d}|{rules.step_minutes}|{rules.min_rr}|{rules.final}|" \
-          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{rules.timeframe}|{code}"
+          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{rules.timeframe}|{rules.model}|{code}"
     return f"{start:%Y%m%d}-{end:%Y%m%d}-{hashlib.sha1(raw.encode()).hexdigest()[:10]}"
 
 
@@ -432,23 +438,32 @@ def summarize(entries: list[Entry], start: datetime, end: datetime, symbols: lis
     positive = sum(1 for q in by_quarter.values() if (q["expectancy_r"] or 0) > 0)
     rated = sum(1 for q in by_quarter.values() if q["filled"] >= 10)
     n = len(finished)
+    rs = [e.result_r for e in finished]
+    t_score = None
+    if n >= 2:
+        sd = float(np.std(rs, ddof=1))
+        t_score = float(np.mean(rs)) / (sd / n ** 0.5) if sd > 0 else None
+    steady = rated and positive / max(rated, 1) >= 2 / 3
     if n < 100:
         verdict = (f"Not enough trades to judge: {n} filled (at least 100 are needed). "
                    "Run a longer history before reading anything into these numbers.")
-    elif (s.avg_r or 0) > 0 and (s.profit_factor or 0) > 1 and rated and positive / max(rated, 1) >= 2 / 3:
-        verdict = (f"Evidence of an edge: {n} filled trades at {s.avg_r:+.2f}R each, profitable in "
-                   f"{positive} of {len(by_quarter)} quarters. This is the bar new ideas must beat.")
+    elif (s.avg_r or 0) > 0 and (s.profit_factor or 0) > 1 and steady and (t_score or 0) >= 2:
+        verdict = (f"Evidence of an edge: {n} filled trades at {s.avg_r:+.2f}R each (t-score {t_score:.1f}), "
+                   f"profitable in {positive} of {len(by_quarter)} quarters. This is the bar new ideas must beat.")
     elif (s.avg_r or 0) > 0:
-        verdict = (f"A thin, unsteady edge: {s.avg_r:+.2f}R per trade over {n} filled trades, but positive "
-                   f"in only {positive} of {len(by_quarter)} quarters. The rules alone are not yet reliable.")
+        verdict = (f"A thin edge that could still be luck: {s.avg_r:+.2f}R per trade over {n} filled trades "
+                   f"(t-score {t_score or 0:.1f}, needs 2), positive in {positive} of {len(by_quarter)} quarters. "
+                   "Promising enough to study, not yet to trust.")
     else:
         verdict = (f"No edge in the rules alone: {s.avg_r:+.2f}R per trade over {n} filled trades. "
                    "The desk's filtering, or new rules from the lab, must find one.")
+    metrics["t_score"] = None if t_score is None else round(t_score, 2)
     return Report(
         start=start.date().isoformat(), end=end.date().isoformat(), symbols=symbols,
         rules={"step_minutes": rules.step_minutes, "min_rr": rules.min_rr, "final": rules.final,
                "max_per_currency": rules.max_per_currency, "window": rules.window.label(),
-               "latest_cancel": rules.latest_cancel.strftime("%H:%M")},
+               "latest_cancel": rules.latest_cancel.strftime("%H:%M"), "model": rules.model,
+               "timeframe": rules.timeframe},
         orders=len(entries), filled=n, trading_days=days, metrics=metrics, grades=grades,
         by_symbol=_group(entries, lambda e: e.symbol),
         by_hour=_group(entries, lambda e: f"{e.created_at.astimezone(NEW_YORK):%H}:00"),
