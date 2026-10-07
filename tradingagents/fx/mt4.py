@@ -11,7 +11,9 @@ one chart; it reads instructions, acts, and answers:
 The journal stays the desk's record, priced on OANDA mid. :meth:`Bridge.sync`
 makes the MT4 book follow it, one step per order:
 
-- a new pending order in the journal is placed as a limit order, ``lots`` each;
+- a new pending order in the journal is placed as a limit order, ``lots`` each,
+  with its levels shifted half of CMC's spread (see :func:`broker_levels`) so
+  it fills and exits when the mid price reaches them, as the journal assumes;
 - a stop or target the trade manager moved is moved in MT4;
 - an order the journal no longer waits on (cancelled, expired, missed, or a
   paper trade that already finished) is deleted if it has not filled at CMC;
@@ -76,7 +78,8 @@ CREATE TABLE IF NOT EXISTS mt4_orders (
     close_price REAL,
     profit REAL,
     note TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    half_spread REAL
 )
 """
 
@@ -294,6 +297,7 @@ class Row:
     profit: float | None = None
     note: str = ""
     updated_at: datetime | None = None
+    half_spread: float | None = None       # levels shifted by this so CMC acts on the mid price
 
 
 _ROW_FIELDS = list(Row.__dataclass_fields__)
@@ -312,6 +316,9 @@ class Bridge:
         self._retries: dict[str, int] = {}
         with closing(self._db()) as db, db:
             db.execute(TABLE)
+            columns = {r[1] for r in db.execute("PRAGMA table_info(mt4_orders)")}
+            if "half_spread" not in columns:              # tables from before spread adjustment
+                db.execute("ALTER TABLE mt4_orders ADD COLUMN half_spread REAL")
 
     # -- storage --------------------------------------------------------------
 
@@ -485,8 +492,13 @@ class Bridge:
             if ok:
                 row.state, row.mt4 = B_PENDING, int(ans.get("mt4") or 0) or None
                 row.sent_sl, row.sent_tp = row.want_sl, row.want_tp
+                at = float(ans.get("price") or 0)
+                levels = (f" at {at:.7g} · SL {row.sent_sl:.7g} · TP {row.sent_tp:.7g}"
+                          if at and row.sent_sl is not None and row.sent_tp is not None else "")
+                spread = (f" (levels shifted {row.half_spread / spec_for(row.symbol).pip:.1f} pips for CMC's spread)"
+                          if row.half_spread else "")
                 notify(f"📤 <b>CMC</b> {row.ticket} {row.side.upper()} LIMIT {row.broker_symbol} "
-                       f"{row.lots:g} lot placed (MT4 #{row.mt4})")
+                       f"{row.lots:g} lot placed{levels}{spread} (MT4 #{row.mt4})")
             else:
                 row.state, row.note = FAILED, message
                 if message.startswith(RETRYABLE):
@@ -579,8 +591,9 @@ class Bridge:
     @staticmethod
     def _moved(row: Row, e: Entry) -> bool:
         tick = spec_for(e.symbol).pip / 100
-        return (row.sent_sl is None or abs(e.stop - row.sent_sl) > tick
-                or row.sent_tp is None or abs(e.target - row.sent_tp) > tick)
+        _, sl, tp = broker_levels(e.long, e.entry, e.stop, e.target, row.half_spread or 0.0)
+        return (row.sent_sl is None or abs(sl - row.sent_sl) > tick
+                or row.sent_tp is None or abs(tp - row.sent_tp) > tick)
 
     def _act(self, row: Row, action: str, now: datetime) -> None:
         row.inflight = self.send(action, now, ticket=row.ticket, mt4=row.mt4)
@@ -588,9 +601,10 @@ class Bridge:
         self._save(row, now)
 
     def _modify(self, row: Row, e: Entry, now: datetime) -> None:
-        row.want_sl, row.want_tp = e.stop, e.target
+        _, sl, tp = broker_levels(e.long, e.entry, e.stop, e.target, row.half_spread or 0.0)
+        row.want_sl, row.want_tp = sl, tp
         row.inflight = self.send("modify", now, ticket=row.ticket, mt4=row.mt4,
-                                 sl=_price(e.stop), tp=_price(e.target))
+                                 sl=_price(sl), tp=_price(tp))
         row.inflight_action, row.inflight_at = "modify", now
         self._save(row, now)
 
@@ -614,15 +628,44 @@ class Bridge:
                 self._save(row, now)
                 notify(f"⚠️ <b>CMC</b> {e.ticket} {e.symbol} not placed: {row.note} (wrong symbol?).")
                 return
-        row.state, row.want_sl, row.want_tp = SENDING, e.stop, e.target
+        row.half_spread = half_spread(quote, e.spread)
+        entry, sl, tp = broker_levels(e.long, e.entry, e.stop, e.target, row.half_spread)
+        row.state, row.want_sl, row.want_tp = SENDING, sl, tp
         row.inflight = self.send(
             "place", now, ticket=e.ticket, symbol=broker, side=side, lots=f"{self.lots:.2f}",
-            price=_price(e.entry), sl=_price(e.stop), tp=_price(e.target),
+            price=_price(entry), sl=_price(sl), tp=_price(tp),
             comment=f"TA{e.ticket}", expires=int(e.expires_at.timestamp()),
             close_by=int(day_close(e.created_at).timestamp()))
         row.inflight_action, row.inflight_at = "place", now
         self._save(row, now)
         notes.append(f"sent {e.ticket} {e.symbol} to MT4")
+
+
+def half_spread(quote: tuple[float, float] | None, planned_spread: float) -> float:
+    """Half of CMC's spread now, capped at three times the spread the desk planned with.
+
+    The cap keeps a momentary blow-out (rollover, a news spike) from shifting
+    the levels of an order that will wait for hours.
+    """
+    if quote is None:
+        return max(planned_spread, 0.0) / 2
+    spread = max(quote[1] - quote[0], 0.0)
+    if planned_spread > 0:
+        spread = min(spread, 3 * planned_spread)
+    return spread / 2
+
+
+def broker_levels(long: bool, entry: float, stop: float, target: float, half: float) -> tuple[float, float, float]:
+    """The desk's mid-price levels as MT4 levels that trigger when the mid price gets there.
+
+    MT4 fills a buy limit and exits a sell on the ask, and fills a sell limit
+    and exits a buy on the bid; the ask is half a spread above the mid and the
+    bid half a spread below. So a buy's entry goes up half a spread and its
+    stop and target down; a sell's the other way. Risk grows and reward
+    shrinks by one spread, the same net figures the journal scores.
+    """
+    sign = 1 if long else -1
+    return entry + sign * half, stop - sign * half, target - sign * half
 
 
 def _price(value: float) -> str:

@@ -59,7 +59,8 @@ class FakeEA:
             elif cmd["action"] in ("cancel", "close"):
                 o = self.orders.pop(ticket)
                 self.history[ticket] = {**o, "profit": "0.00", "close": o["price"]}
-            text = f"id={cmd['id']}\r\nok={int(ok)}\r\nmt4={ticket}\r\nerror=0\r\nprice=0\r\nmessage={msg}\r\n"
+            price = cmd["price"] if cmd["action"] == "place" else "0"
+            text = f"id={cmd['id']}\r\nok={int(ok)}\r\nmt4={ticket}\r\nerror=0\r\nprice={price}\r\nmessage={msg}\r\n"
             (self.dir / f"ta_res_{cmd['id']}.txt").write_text(text)
         self.write_state()
 
@@ -93,7 +94,8 @@ def test_a_new_journal_order_is_placed_once_with_its_times(desk):
     desk.sync()
     [cmd] = desk.ea.received
     assert cmd["action"] == "place" and cmd["symbol"] == "EURUSD" and cmd["side"] == "buy"
-    assert cmd["lots"] == "0.01" and cmd["price"] == "1.17" and cmd["sl"] == "1.168" and cmd["tp"] == "1.175"
+    # CMC quotes 1.1719/1.1721: the long's levels move half that spread so they trigger on the mid
+    assert cmd["lots"] == "0.01" and cmd["price"] == "1.1701" and cmd["sl"] == "1.1679" and cmd["tp"] == "1.1749"
     assert cmd["comment"] == "TA#1043"
     assert int(cmd["expires"]) == int(e.expires_at.timestamp())
     assert int(cmd["close_by"]) == int(datetime(2026, 10, 6, 21, 0, tzinfo=UTC).timestamp())   # 17:00 NY
@@ -135,8 +137,9 @@ def test_the_trade_managers_changes_reach_mt4(desk):
     desk.sync(later)
     desk.ea.run()
     desk.sync(later)
-    assert desk.ea.received[-1]["action"] == "modify" and desk.ea.received[-1]["sl"] == "1.1702"
-    assert desk.ea.orders[5001]["sl"] == "1.1702"
+    # a long's stop sits half CMC's 0.2-pip spread under the desk's mid-price level
+    assert desk.ea.received[-1]["action"] == "modify" and desk.ea.received[-1]["sl"] == "1.1701"
+    assert desk.ea.orders[5001]["sl"] == "1.1701"
     desk.sync(later)
     desk.ea.run()
     assert len(desk.ea.received) == 2                                  # no repeat once applied
@@ -363,3 +366,43 @@ def test_a_late_order_is_retried_at_most_three_times(desk):
             (desk.ea.dir / f"ta_res_{cmd['id']}.txt").write_text(
                 f"id={cmd['id']}\r\nok=0\r\nmt4=0\r\nerror=0\r\nmessage=stale instruction, ignored\r\n")
     assert sends == 4                                                  # the first send and three retries
+
+
+@pytest.mark.unit
+def test_levels_shift_half_a_spread_so_mt4_acts_on_the_mid_price():
+    # a buy fills on the ask and exits on the bid
+    assert mt4.broker_levels(True, 1.1700, 1.1680, 1.1750, 0.0001) == pytest.approx((1.1701, 1.1679, 1.1749))
+    # a sell fills on the bid and exits on the ask
+    assert mt4.broker_levels(False, 4118.93, 4123.40, 4103.82, 0.15) == pytest.approx((4118.78, 4123.55, 4103.97))
+    entry, sl, tp = mt4.broker_levels(False, 4118.93, 4123.40, 4103.82, 0.15)
+    assert sl - entry == pytest.approx(4123.40 - 4118.93 + 0.30)     # risk grows by one spread
+    assert entry - tp == pytest.approx(4118.93 - 4103.82 - 0.30)     # reward shrinks by one spread
+
+
+@pytest.mark.unit
+def test_the_spread_used_is_cmcs_now_but_never_a_blow_out():
+    assert mt4.half_spread((1.1719, 1.1721), 0.0001) == pytest.approx(0.0001)
+    assert mt4.half_spread((1.1700, 1.1740), 0.0001) == pytest.approx(0.00015)     # capped at 3x planned
+    assert mt4.half_spread(None, 0.0002) == pytest.approx(0.0001)                  # no CMC price: planned
+
+
+@pytest.mark.unit
+def test_the_placed_message_shows_the_adjusted_levels(desk):
+    desk.book.record([_order()], now=NOW, tickets={"EURUSD": "#1043"})
+    desk.sync()
+    desk.ea.run()
+    desk.sync()
+    [msg] = [m for m in desk.sent if "placed" in m]
+    assert "at 1.1701 · SL 1.1679 · TP 1.1749" in msg and "shifted 1.0 pips for CMC's spread" in msg
+
+
+@pytest.mark.unit
+def test_an_older_bridge_table_gains_the_spread_column(tmp_path):
+    import sqlite3
+    book = Journal(tmp_path / "j.db")
+    with sqlite3.connect(book.path) as db:
+        db.execute(mt4.TABLE.replace(",\n    half_spread REAL", ""))
+    (tmp_path / "Files").mkdir()
+    Bridge(tmp_path / "Files", book)
+    with sqlite3.connect(book.path) as db:
+        assert "half_spread" in {r[1] for r in db.execute("PRAGMA table_info(mt4_orders)")}
