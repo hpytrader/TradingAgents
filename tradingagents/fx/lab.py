@@ -185,11 +185,39 @@ def _entry(s: Setup, t: datetime, n: int) -> Entry:
                  rationale="; ".join(s.reasons[:3]))
 
 
-def replay(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: datetime,
-           rules: Rules | None = None, progress: Callable[[datetime, int], None] | None = None) -> list[Entry]:
-    """Every order the scanner would have handed the desk from ``start`` to ``end``, settled."""
+ScanLog = list[tuple[datetime, list[Setup]]]
+
+
+def scan_log(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: datetime,
+             rules: Rules | None = None, progress: Callable[[datetime, int], None] | None = None) -> ScanLog:
+    """What the scanner offered at every scan from ``start`` to ``end``: the slow part, done once."""
     rules = rules or Rules()
     symbols = [s for s in symbols if (s, "M5") in feed.frames and (s, "H1") in feed.frames]
+    log: ScanLog = []
+    found = 0
+    for t in scan_times(start, end, rules):
+        if not market_open(t):
+            continue
+        feed.now = t
+        result = scan_smc(feed.candles, feed.quote, symbols, min_rr=rules.min_rr, top=rules.final + 4,
+                          max_per_currency=rules.max_per_currency + 1, window=rules.window, now=t,
+                          latest_cancel=rules.latest_cancel)
+        log.append((t, result.setups))
+        found += len(result.setups)
+        if progress:
+            progress(t, found)
+    return log
+
+
+def trade(log: ScanLog, feed: HistoricalFeed, end: datetime, rules: Rules | None = None,
+          experiment=None) -> list[Entry]:
+    """The orders the desk would have placed from ``log``, settled: fast, so ideas can be tried by the dozen.
+
+    ``experiment`` (see :mod:`tradingagents.fx.quinn`) may refuse setups or move
+    their targets before they become orders, exactly as if the scanner itself
+    had that rule.
+    """
+    rules = rules or Rules()
     entries: list[Entry] = []
     seen: set[str] = set()
     seen_day: date | None = None
@@ -201,33 +229,63 @@ def replay(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: d
         k = int(np.searchsorted(ends, pd.Timestamp(now).value, side="right"))
         jr.simulate(e, bars.iloc[first:k], now)         # only this order's bars: fast over long histories
 
-    for t in scan_times(start, end, rules):
-        if not market_open(t):
-            continue
+    for t, offered in log:
         day = t.astimezone(NEW_YORK).date()
         if day != seen_day:
             seen, seen_day = set(), day
         for e in entries:
             if e.status in jr.ACTIVE:
                 settle(e, t)
-        feed.now = t
-        result = scan_smc(feed.candles, feed.quote, symbols, min_rr=rules.min_rr, top=rules.final + 4,
-                          max_per_currency=rules.max_per_currency + 1, window=rules.window, now=t,
-                          latest_cancel=rules.latest_cancel)
+        setups = offered
+        if experiment is not None:
+            setups = [experiment.adjust(s) for s in offered if experiment.admits(s, t)]
         on_book = {(e.symbol, e.direction) for e in entries if e.status in jr.ACTIVE}
-        fresh = [s for s in result.setups
-                 if (s.symbol, s.direction) not in on_book and setup_key(s) not in seen]
-        seen |= {setup_key(s) for s in result.setups}
+        fresh = [s for s in setups if (s.symbol, s.direction) not in on_book and setup_key(s) not in seen]
+        seen |= {setup_key(s) for s in setups}
         for s in fresh[:rules.final]:
-            entries.append(_entry(s, t, len(entries) + 1))
+            e = _entry(s, t, len(entries) + 1)
+            e.features = {**s.features, "hour": t.astimezone(NEW_YORK).hour, "target_kind": s.target_kind}
+            entries.append(e)
             on_book.add((s.symbol, s.direction))
-        if progress:
-            progress(t, len(entries))
 
     for e in entries:                                         # play every order out to its end
         if e.status in jr.ACTIVE:
             settle(e, max(end, jr.day_close(e.created_at) + timedelta(minutes=5)))
     return entries
+
+
+def replay(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: datetime,
+           rules: Rules | None = None, progress: Callable[[datetime, int], None] | None = None,
+           experiment=None) -> list[Entry]:
+    """Every order the scanner would have handed the desk from ``start`` to ``end``, settled."""
+    rules = rules or Rules()
+    return trade(scan_log(feed, symbols, start, end, rules, progress), feed, end, rules, experiment)
+
+
+def log_key(symbols: Iterable[str], start: datetime, end: datetime, rules: Rules) -> str:
+    """A name for a cached scan log: changes when the period, rules or scanner code change."""
+    import hashlib
+
+    from tradingagents.fx import smc, smc_scanner
+    code = "".join(Path(m.__file__).read_text(encoding="utf-8") for m in (smc, smc_scanner))
+    raw = f"{sorted(symbols)}|{start:%Y%m%d}|{end:%Y%m%d}|{rules.step_minutes}|{rules.min_rr}|{rules.final}|" \
+          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{code}"
+    return f"{start:%Y%m%d}-{end:%Y%m%d}-{hashlib.sha1(raw.encode()).hexdigest()[:10]}"
+
+
+def cached_scan_log(folder: Path, feed: HistoricalFeed, symbols: list[str], start: datetime, end: datetime,
+                    rules: Rules, progress=None) -> ScanLog:
+    """:func:`scan_log`, kept on disk so each later experiment skips the slow scanning."""
+    import pickle
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"scans-{log_key(symbols, start, end, rules)}.pkl"
+    if path.exists():
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+    log = scan_log(feed, symbols, start, end, rules, progress)
+    with path.open("wb") as fh:
+        pickle.dump(log, fh)
+    return log
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +456,8 @@ def save(r: Report, entries: list[Entry], folder: Path, name: str = "baseline") 
                "direction": e.direction, "entry": e.entry, "stop": e.stop, "target": e.target,
                "rr": e.planned_rr, "score": e.scanner_score, "status": e.status, "result_r": e.result_r,
                "filled_at": e.filled_at.isoformat() if e.filled_at else None,
-               "exit_at": e.exit_at.isoformat() if e.exit_at else None, "why": e.rationale} for e in entries]
+               "exit_at": e.exit_at.isoformat() if e.exit_at else None, "note": e.note,
+               "features": getattr(e, "features", {}), "why": e.rationale} for e in entries]
     js.write_text(json.dumps({"report": json.loads(r.to_json()), "trades": trades}, indent=1, default=str),
                   encoding="utf-8")
     return md, js

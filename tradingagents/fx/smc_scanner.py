@@ -356,6 +356,10 @@ def _from_sweep(spec, m5, h1, sweep, shift, liquidity, long, mid, spread,
         zone_low=spec.round_price(zone.low),
         zone_high=spec.round_price(zone.high),
         invalidation=spec.round_price(extreme),
+        features={"pool": sweep.pool.name, "pool_quality": sweep.pool.quality, "shift": shift.kind,
+                  "h1_break": h1_break.kind, "zone": confluence, "displacement": round(displacement, 2),
+                  "depth": round(depth, 2), "minutes_since_shift": round(minutes), "wide_spread": spread > 0.3 * atr5,
+                  "stop_widened": bool(widened)},
     )
 
 

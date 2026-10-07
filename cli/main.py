@@ -675,22 +675,23 @@ def fx_mt4(
 
 @app.command("fx-lab")
 def fx_lab(
-    months: int = typer.Option(12, "--months", help="How many months of history to replay"),
+    months: int = typer.Option(12, "--months", help="How many months of history to replay (each year, with --experiments)"),
     step: int = typer.Option(10, "--step", help="Minutes between scans, as the watcher runs them"),
     symbols: str = typer.Option(None, "--symbols", help="Comma-separated pairs; omit for the default list"),
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     final: int = typer.Option(6, "--final", help="Most new orders per scan"),
+    experiments: bool = typer.Option(False, "--experiments", help="Run Quinn's ideas: design year, then the locked year"),
     refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
     notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
 ):
-    """Quinn's lab: replay today's scanner over past OANDA prices and grade it against the benchmarks."""
+    """Quinn's lab: replay today's scanner over past OANDA prices and grade it, or test new ideas with --experiments."""
     from datetime import UTC, datetime, timedelta
 
     from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
     from rich.table import Table
 
     from tradingagents.dataflows.vendors import oanda
-    from tradingagents.fx import DEFAULT_UNIVERSE, lab, telegram
+    from tradingagents.fx import DEFAULT_UNIVERSE, lab, quinn, telegram
     from tradingagents.fx.smc import NEW_YORK
 
     if months < 1 or step < 1 or final < 1:
@@ -699,60 +700,102 @@ def fx_lab(
     names = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
     _require_oanda(names[0])
     end = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=round(months * 30.44))
+    span = timedelta(days=round(months * 30.44))
+    start = end - span
+    locked_start = start - span                     # the year before: Quinn's locked test year
     history = lab.History(lab.lab_dir() / "history")
-    console.print(f"[bold]Quinn's lab · baseline[/bold] · {start:%d %b %Y} to {end:%d %b %Y} · "
-                  f"{len(names)} instruments · scans every {step} min, 02:00-12:00 New York")
+    rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final)
+    title = "experiments" if experiments else "baseline"
+    console.print(f"[bold]Quinn's lab · {title}[/bold] · design year {start:%d %b %Y} to {end:%d %b %Y}"
+                  + (f" · locked year {locked_start:%d %b %Y} to {start:%d %b %Y}" if experiments else "")
+                  + f" · {len(names)} instruments · scans every {step} min, 02:00-12:00 New York")
 
-    frames = {}
     columns = (TextColumn("{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"),
                TimeRemainingColumn())
+    first = (locked_start if experiments else start) - lab.WARMUP
+    frames = {}
     with Progress(*columns, console=console) as bar:
         job = bar.add_task("Price history", total=len(names) * len(lab.GRANULARITIES))
         for symbol in names:
             for gran in lab.GRANULARITIES:
                 bar.update(job, description=f"Price history · {symbol} {gran}")
                 try:
-                    frames[(symbol, gran)] = history.ensure(symbol, gran, start - lab.WARMUP, end,
+                    frames[(symbol, gran)] = history.ensure(symbol, gran, first, end,
                                                             oanda.get_candle_history, refresh=refresh)
                 except Exception as exc:
                     console.print(f"[yellow]{symbol} {gran}: {exc}; left out.[/yellow]")
                 bar.advance(job)
     feed = lab.HistoricalFeed(frames)
-    rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final)
-    days = max((end - start).days, 1)
-    with Progress(*columns, console=console) as bar:
-        job = bar.add_task("Replaying", total=days)
-
-        def moved(t, orders):
-            done = (t - start).days
-            bar.update(job, completed=done,
-                       description=f"Replaying · {t.astimezone(NEW_YORK):%d %b %Y} · {orders} orders")
-
-        entries = lab.replay(feed, names, start, end, rules, progress=moved)
-        bar.update(job, completed=days)
     used = sorted({s for s, _ in frames})
-    report = lab.summarize(entries, start, end, used, rules)
-    md, js = lab.save(report, entries, lab.lab_dir())
-    console.print(f"\n[bold]{report.verdict}[/bold]\n")
-    table = Table(title="Against the benchmarks")
-    for col in ("Measure", "Result", "Red line", "Target", "Strong", "Grade"):
-        table.add_column(col, justify="right" if col not in ("Measure", "Grade") else "left")
-    for key, (label, red, target, strong, _, fmt) in lab.BENCHMARKS.items():
-        value = report.metrics.get(key)
-        table.add_row(label, "—" if value is None else fmt.format(value), fmt.format(red), fmt.format(target),
-                      fmt.format(strong), report.grades[key])
+
+    def scans(a, b, label):
+        days = max((b - a).days, 1)
+        with Progress(*columns, console=console) as bar:
+            job = bar.add_task(label, total=days)
+
+            def moved(t, found):
+                bar.update(job, completed=(t - a).days,
+                           description=f"{label} · {t.astimezone(NEW_YORK):%d %b %Y} · {found} setups")
+
+            log = lab.cached_scan_log(lab.lab_dir() / "scans", feed, used, a, b, rules, progress=moved)
+            bar.update(job, completed=days)
+        return log
+
+    design_log = scans(start, end, "Scanning the design year")
+    if not experiments:
+        entries = lab.trade(design_log, feed, end, rules)
+        report = lab.summarize(entries, start, end, used, rules)
+        md, js = lab.save(report, entries, lab.lab_dir())
+        console.print(f"\n[bold]{report.verdict}[/bold]\n")
+        table = Table(title="Against the benchmarks")
+        for col in ("Measure", "Result", "Red line", "Target", "Strong", "Grade"):
+            table.add_column(col, justify="right" if col not in ("Measure", "Grade") else "left")
+        for key, (label, red, target, strong, _, fmt) in lab.BENCHMARKS.items():
+            value = report.metrics.get(key)
+            table.add_row(label, "—" if value is None else fmt.format(value), fmt.format(red), fmt.format(target),
+                          fmt.format(strong), report.grades[key])
+        console.print(table)
+        m = report.metrics
+        console.print(f"{report.orders} orders, {report.filled} filled ({m['filled_per_day']} a day), "
+                      f"total {m['total_r']:+.2f}R.")
+        console.print(f"Full report: {md}\nTrades for Quinn: {js}")
+        if notify and telegram.configured():
+            try:
+                telegram.send(lab.telegram_summary(report))
+            except telegram.TelegramError as exc:
+                console.print(f"[yellow]Telegram: {exc}[/yellow]")
+        return
+
+    locked_log = scans(locked_start, start, "Scanning the locked year")
+    ledger = quinn.Ledger(lab.lab_dir() / "ledger.json")
+    base_design = quinn.measure(lab.trade(design_log, feed, end, rules))
+    base_locked = quinn.measure(lab.trade(locked_log, feed, start, rules))
+    rows = []
+    for exp in quinn.FIRST_BATCH:
+        console.print(f"Trying [bold]{exp.name}[/bold]: {exp.describe()}")
+        rows.append(quinn.run(exp, lambda e: lab.trade(design_log, feed, end, rules, e),
+                              lambda e: lab.trade(locked_log, feed, start, rules, e), base_design, ledger))
+    table = Table(title=f"Unchanged rules: {base_design.expectancy_r:+.2f}R per trade on the design year")
+    for col in ("Idea", "Design trades", "Per trade", "PF", "Locked per trade", "t / bar", "Status"):
+        table.add_column(col)
+    for r in rows:
+        d, lk = r["design"], r["locked"]
+        table.add_row(r["name"], str(d["trades"]),
+                      "—" if d["expectancy_r"] is None else f"{d['expectancy_r']:+.2f}R", str(d["profit_factor"]),
+                      "—" if lk is None else f"{lk['expectancy_r']:+.2f}R", "—" if lk is None
+                      else f"{lk['t_score']} / {r['locked_bar']}",
+                      {"rejected on the design year": "✕ design year", "failed on the locked year": "✕ locked year"}
+                      .get(r["status"], "✅ candidate"))
     console.print(table)
-    m = report.metrics
-    console.print(f"{report.orders} orders, {report.filled} filled ({m['filled_per_day']} a day), "
-                  f"total {m['total_r']:+.2f}R.")
-    console.print(f"Full report: {md}\nTrades for Quinn: {js}")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
+    md = lab.lab_dir() / f"experiments-{stamp}.md"
+    md.write_text(quinn.report(rows, base_design, base_locked, ledger), encoding="utf-8")
+    console.print(f"Full report: {md}\nLedger: {ledger.path}")
     if notify and telegram.configured():
         try:
-            telegram.send(lab.telegram_summary(report))
+            telegram.send(quinn.telegram_summary(rows))
         except telegram.TelegramError as exc:
             console.print(f"[yellow]Telegram: {exc}[/yellow]")
-
 
 def _fx_desk_inputs(setups, now):
     """Tickets for the candidates and a snapshot of the live book, for a review."""
