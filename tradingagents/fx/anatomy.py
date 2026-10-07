@@ -189,8 +189,10 @@ def study(entries: list[Entry], frames: dict[tuple[str, str], pd.DataFrame]) -> 
 def findings(a: Anatomy) -> list[str]:
     """The plain-language reading, one line per suspect."""
     out = []
+    leaks = 0                                          # suspects that point at a fix
     cost = a.gross_r - a.net_r
     if a.gross_r > 0 and a.net_r <= 0:
+        leaks += 1
         out.append(f"COSTS: before the spread the rules make {a.gross_r:+.2f}R a trade; the spread "
                    f"({a.spread_share:.0%} of the risk on average) costs {cost:.2f}R and turns it into "
                    f"{a.net_r:+.2f}R. The raw edge is thin and the spread is too big a share of each trade: "
@@ -204,6 +206,7 @@ def findings(a: Anatomy) -> list[str]:
     hunt = a.target_after_stop
     fast = a.stopped_within_15
     if hunt >= 0.20 or fast >= 0.35:
+        leaks += 1
         out.append(f"STOPS: {hunt:.0%} of losers were stopped and then reached the target the same day, and "
                    f"{fast:.0%} were stopped within 15 minutes of the fill: the stop sits where the next sweep "
                    "goes, or the entry is early. Test a confirmation entry, or a stop beyond the whole zone.")
@@ -213,6 +216,7 @@ def findings(a: Anatomy) -> list[str]:
     gave_back = a.losers_mfe.get("1R", 0.0)
     best = max(a.breakeven_r, a.half_off_r)
     if gave_back >= 0.25 or best - a.net_r >= 0.05:
+        leaks += 1
         which = "break-even at +1R" if a.breakeven_r >= a.half_off_r else "half off at +1R"
         out.append(f"EXITS: {gave_back:.0%} of losers were +1R up before turning into a full loss. With "
                    f"{which} the same trades make {best:+.2f}R a trade instead of {a.net_r:+.2f}R. "
@@ -221,7 +225,7 @@ def findings(a: Anatomy) -> list[str]:
         out.append(f"EXITS: only {gave_back:.0%} of losers were ever +1R up; a break-even stop gives "
                    f"{a.breakeven_r:+.2f}R and half off at +1R {a.half_off_r:+.2f}R a trade, against "
                    f"{a.net_r:+.2f}R now. Exits are not the main leak.")
-    if not any(" is a fix to try" in f or "Test a confirmation" in f or "worth testing" in f for f in out):
+    if not leaks:
         out.append("VERDICT: no single leak. The setup itself shows no edge on these timeframes: the next step "
                    "is a different version of it (a higher timeframe) or a different strategy, not a filter.")
     if a.same_bar_losses >= 0.05:

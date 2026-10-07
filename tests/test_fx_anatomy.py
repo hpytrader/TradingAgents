@@ -101,3 +101,14 @@ def test_a_thin_edge_eaten_by_the_spread_is_called_out():
                         half_off_r=-0.07, same_bar_losses=0.0)
     costs = anatomy.findings(a)[0]
     assert costs.startswith("COSTS: before the spread the rules make +0.03R") and "fix to try" in costs
+
+
+@pytest.mark.unit
+def test_no_verdict_line_when_costs_point_at_a_fix():
+    a = anatomy.Anatomy(trades=2661, net_r=-0.07, gross_r=0.06, spread_share=0.16, win_rate=0.35,
+                        winners_mae={"0.5R": 0.38}, losers_mfe={"1R": 0.249}, stopped_within_15=0.07,
+                        stopped_within_60=0.32, target_after_stop=0.17, closed_at_17=0.18, breakeven_r=-0.10,
+                        half_off_r=-0.10, same_bar_losses=0.0)
+    lines = anatomy.findings(a)
+    assert lines[0].startswith("COSTS: before the spread the rules make +0.06R")
+    assert not any(line.startswith("VERDICT") for line in lines)
