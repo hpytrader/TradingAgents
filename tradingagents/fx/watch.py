@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -202,9 +202,19 @@ def _scan_and_review(now, report: Cycle, *, journal, scan_fn, review_fn, notify,
     except Exception as exc:
         report.notes.append(f"scan failed: {exc}")
         return
-    keys = {setup_key(s) for s in result.setups}
+    # A setup for a symbol and direction the desk already has pending or open
+    # cannot become an order (the journal keeps one per side), so it is not
+    # worth a review: the scanner often finds the same idea again after it
+    # was ordered, with a slightly different zone.
+    on_book = {(e.symbol, e.direction): e.ticket for e in journal.entries(ACTIVE)}
+    setups = [s for s in result.setups if (s.symbol, s.direction) not in on_book]
+    if len(setups) != len(result.setups):
+        dupes = [(s.symbol, f"already on the book as {on_book[(s.symbol, s.direction)]}")
+                 for s in result.setups if (s.symbol, s.direction) in on_book]
+        result = replace(result, setups=setups, skipped=[*result.skipped, *dupes])
+    keys = {setup_key(s) for s in setups}
     fresh = keys - state.seen
-    report.candidates, report.new_setups = len(result.setups), len(fresh)
+    report.candidates, report.new_setups = len(setups), len(fresh)
     if not fresh:
         return
     if state.agent_runs >= max_agent_runs:

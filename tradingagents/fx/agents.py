@@ -89,7 +89,9 @@ def describe_candidate(s: Setup, ctx: ReviewContext) -> str:
         f"{s.target_kind}), {s.rr:.2f}R after a {s.spread_pips}-pip spread",
         f"- Price at scan {s.price}; 1h ATR {s.atr_pips} pips; scanner score {s.score:.0f}/100",
         *([f"- SMC setup: entry zone {s.zone_low}–{s.zone_high}; idea invalid beyond the extreme of the move "
-           f"{s.invalidation} (trading back through the swept level is normal; past this is not)"] if s.strategy == "smc" else []),
+           f"{s.invalidation} (trading back through the swept level is normal; past this is not). The stop sits a "
+           f"buffer beyond that extreme by design (the larger of 3 spreads and 0.3 x the 5m ATR), so a wick to it "
+           f"does not stop the trade: a stop beyond the invalidation level is correct, not a flaw"] if s.strategy == "smc" else []),
         f"- Order expires {s.expires_at:%H:%M} UTC unless cancelled sooner",
     ]
     lines += [f"- {reason}" for reason in s.reasons]
