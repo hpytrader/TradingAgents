@@ -190,14 +190,17 @@ def findings(a: Anatomy) -> list[str]:
     """The plain-language reading, one line per suspect."""
     out = []
     cost = a.gross_r - a.net_r
-    if a.gross_r > 0.05:
+    if a.gross_r > 0 and a.net_r <= 0:
         out.append(f"COSTS: before the spread the rules make {a.gross_r:+.2f}R a trade; the spread "
                    f"({a.spread_share:.0%} of the risk on average) costs {cost:.2f}R and turns it into "
-                   f"{a.net_r:+.2f}R. Bigger trades (a higher timeframe, wider stops) are the first fix to try.")
+                   f"{a.net_r:+.2f}R. The raw edge is thin and the spread is too big a share of each trade: "
+                   "bigger trades (a higher timeframe, wider stops) are a fix to try.")
+    elif a.gross_r > 0:
+        out.append(f"COSTS: {a.gross_r:+.2f}R a trade before the spread, {a.net_r:+.2f}R after "
+                   f"({a.spread_share:.0%} of the risk). Costs are affordable.")
     else:
-        out.append(f"COSTS: even before the spread the rules make only {a.gross_r:+.2f}R a trade "
-                   f"(the spread, {a.spread_share:.0%} of the risk, costs {cost:.2f}R). Costs are not the "
-                   "main leak.")
+        out.append(f"COSTS: the rules lose even before the spread ({a.gross_r:+.2f}R a trade); "
+                   "cutting costs alone cannot fix them.")
     hunt = a.target_after_stop
     fast = a.stopped_within_15
     if hunt >= 0.20 or fast >= 0.35:
@@ -218,7 +221,7 @@ def findings(a: Anatomy) -> list[str]:
         out.append(f"EXITS: only {gave_back:.0%} of losers were ever +1R up; a break-even stop gives "
                    f"{a.breakeven_r:+.2f}R and half off at +1R {a.half_off_r:+.2f}R a trade, against "
                    f"{a.net_r:+.2f}R now. Exits are not the main leak.")
-    if not any(" is the first fix" in f or "Test a confirmation" in f or "worth testing" in f for f in out):
+    if not any(" is a fix to try" in f or "Test a confirmation" in f or "worth testing" in f for f in out):
         out.append("VERDICT: no single leak. The setup itself shows no edge on these timeframes: the next step "
                    "is a different version of it (a higher timeframe) or a different strategy, not a filter.")
     if a.same_bar_losses >= 0.05:

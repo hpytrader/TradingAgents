@@ -681,6 +681,7 @@ def fx_lab(
     min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
     final: int = typer.Option(6, "--final", help="Most new orders per scan"),
     experiments: bool = typer.Option(False, "--experiments", help="Run Quinn's ideas: design year, then the locked year"),
+    batch: int = typer.Option(None, "--batch", help="Which batch of Quinn's ideas to run (default: the newest)"),
     anatomy: bool = typer.Option(False, "--anatomy", help="Study how the design year's trades played out: costs, stops, exits"),
     refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
     notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
@@ -810,7 +811,12 @@ def fx_lab(
     base_design = quinn.measure(lab.trade(design_log, feed, end, rules))
     base_locked = quinn.measure(lab.trade(locked_log, feed, start, rules))
     rows = []
-    for exp in quinn.FIRST_BATCH:
+    number = batch or max(quinn.BATCHES)
+    if number not in quinn.BATCHES:
+        console.print(f"[red]No batch {number}; there are {sorted(quinn.BATCHES)}.[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"Batch {number}: {len(quinn.BATCHES[number])} ideas")
+    for exp in quinn.BATCHES[number]:
         console.print(f"Trying [bold]{exp.name}[/bold]: {exp.describe()}")
         row = quinn.run(exp, lambda e: lab.trade(design_log, feed, end, rules, e),
                         lambda e: lab.trade(locked_log, feed, start, rules, e), base_design, ledger)

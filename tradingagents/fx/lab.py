@@ -238,6 +238,8 @@ def trade(log: ScanLog, feed: HistoricalFeed, end: datetime, rules: Rules | None
             e = _entry(s, t, len(entries) + 1)
             e.features = {**s.features, "hour": t.astimezone(NEW_YORK).hour, "target_kind": s.target_kind}
             _settle(feed, e)
+            if experiment is not None and getattr(experiment, "manage", None):
+                _manage(feed, e, experiment.manage)
             entries.append(e)
             live.append((_free_from(e), e))
             on_book.add((s.symbol, s.direction))
@@ -256,6 +258,18 @@ def _settle(feed: HistoricalFeed, e: Entry) -> None:
     horizon = jr.day_close(e.created_at) + timedelta(minutes=5)
     last = int(np.searchsorted(_ns(bars.index), pd.Timestamp(horizon).value, side="right"))
     jr.simulate(e, bars.iloc[first:last], horizon)
+
+
+def _manage(feed: HistoricalFeed, e: Entry, how: str) -> None:
+    """Replace a filled order's result with what managing it at +1R would have made."""
+    from tradingagents.fx.anatomy import _bars, _what_if
+    if e.filled_at is None or e.status not in jr.FINISHED:
+        return
+    path = _bars(feed.frames[(e.symbol, "M5")], e.filled_at, jr.day_close(e.filled_at))
+    r = round(_what_if(e, path, half=how == "half_off"), 2)
+    e.result_r = r
+    e.status = jr.WON if r > 0 else jr.LOST if r <= -1 else jr.CLOSED
+    e.note = f"managed ({how} at +1R)"
 
 
 def _free_from(e: Entry) -> datetime:

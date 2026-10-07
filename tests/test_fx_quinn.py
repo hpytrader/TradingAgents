@@ -119,3 +119,29 @@ def test_a_scan_log_is_cached_and_its_name_tracks_the_rules(tmp_path, monkeypatc
     k1 = lab.log_key(["EURUSD"], MON, MON + timedelta(days=1), lab.Rules())
     k2 = lab.log_key(["EURUSD"], MON, MON + timedelta(days=1), lab.Rules(min_rr=2.5))
     assert k1 != k2
+
+
+@pytest.mark.unit
+def test_wider_stops_keep_the_target_and_lower_the_reward_to_risk():
+    s = _setup(MON, entry=1.1690, stop=1.1680, target=1.1720)
+    wide = Experiment("x", "", stop_mult=2.0).adjust(s)
+    assert wide.stop == pytest.approx(1.1670) and wide.target == s.target
+    assert wide.rr == pytest.approx((0.0030 - 0.0001) / (0.0020 + 0.0001), abs=0.01)
+    short = _setup(MON, entry=1.1690, stop=1.1700, target=1.1660, direction="short")
+    assert Experiment("x", "", stop_mult=1.5).adjust(short).stop == pytest.approx(1.1705)
+    assert "stops 2x as far" in Experiment("x", "", stop_mult=2.0, manage="half_off").describe()
+
+
+@pytest.mark.unit
+def test_managed_trades_replace_their_result_with_the_managed_one():
+    from tests.test_fx_anatomy import _path
+    start = MON - timedelta(hours=1)
+    # fills, runs to +1.25R, then falls through the stop: a full loss unmanaged
+    bars = _path([(1.1701, 1.1699)] * 12 + [(1.1701, 1.1689), (1.1716, 1.1700), (1.1700, 1.1679)], start=start)
+    feed = _feed(bars)
+    log = [(MON, [_feat(_setup(MON, entry=1.1690, stop=1.1680, target=1.1730))])]
+    plain = lab.trade(log, feed, MON + timedelta(hours=10))
+    assert plain[0].status == "lost"
+    managed = lab.trade(log, feed, MON + timedelta(hours=10), experiment=Experiment("x", "", manage="breakeven"))
+    assert managed[0].result_r == pytest.approx(-0.0001 / 0.0011, abs=0.01)     # scratched, minus the spread
+    assert managed[0].status == "closed" and "managed" in managed[0].note

@@ -79,7 +79,7 @@ def test_the_study_names_the_leak():
     assert a.trades == 30 and a.losers_mfe["1R"] == 1.0 and a.net_r == -1.0
     assert a.breakeven_r > a.net_r
     assert any(f.startswith("EXITS:") and "worth testing" in f for f in a.findings)
-    assert any(f.startswith("COSTS:") and "not the main leak" in f for f in a.findings)
+    assert any(f.startswith("COSTS:") and "cannot fix them" in f for f in a.findings)
     text = anatomy.to_markdown(a, "test")
     assert "What if: break-even at +1R" in text and "+1R | 100%" in text
 
@@ -91,3 +91,13 @@ def test_no_single_leak_says_so():
                         stopped_within_60=0.4, target_after_stop=0.05, closed_at_17=0.05, breakeven_r=-0.11,
                         half_off_r=-0.12, same_bar_losses=0.0)
     assert anatomy.findings(a)[-1].startswith("VERDICT: no single leak")
+
+
+@pytest.mark.unit
+def test_a_thin_edge_eaten_by_the_spread_is_called_out():
+    a = anatomy.Anatomy(trades=2207, net_r=-0.10, gross_r=0.03, spread_share=0.14, win_rate=0.31,
+                        winners_mae={"0.5R": 0.39}, losers_mfe={"1R": 0.32}, stopped_within_15=0.20,
+                        stopped_within_60=0.52, target_after_stop=0.22, closed_at_17=0.14, breakeven_r=-0.08,
+                        half_off_r=-0.07, same_bar_losses=0.0)
+    costs = anatomy.findings(a)[0]
+    assert costs.startswith("COSTS: before the spread the rules make +0.03R") and "fix to try" in costs
