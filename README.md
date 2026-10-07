@@ -432,7 +432,7 @@ caffeinate -i tradingagents fx-watch --open    # run all morning
 
 ### Placing the orders in MetaTrader 4 (e.g. CMC Markets)
 
-`tradingagents fx-watch --mt4` also places the desk's orders in an MT4 account and keeps them in step with the journal: new limit orders at a fixed lot size (0.01 by default), the trade manager's stop and target moves, his early closes, and cancels for orders the desk no longer waits on. Fills, closes and profit are sent to Telegram. The journal stays the desk's record, priced on OANDA; a trade filled at CMC runs on CMC's prices.
+`tradingagents fx-watch --mt4` also places the desk's orders in an MT4 account and keeps them in step with the journal: new limit orders at a fixed lot size (0.01 by default), with entry, stop and target shifted half of the broker's spread so they trigger when the mid price the desk planned on reaches them, the trade manager's stop and target moves, his early closes, and cancels for orders the desk no longer waits on. Fills, closes and profit are sent to Telegram. The journal stays the desk's record, priced on OANDA; a trade filled at CMC runs on CMC's prices.
 
 MT4 has no API on a Mac, so the watcher and the Expert Advisor `TradingAgentsBridge.mq4` exchange small files in MT4's `MQL4/Files` folder. The EA has its own limits that hold even if the watcher stops: only its own orders (magic number), never above `MaxLots`, at most `MaxOpenOrders`, instructions older than two minutes ignored, unfilled orders deleted at their cancel time and trades closed at 17:00 New York.
 
