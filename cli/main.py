@@ -673,6 +673,87 @@ def fx_mt4(
         console.print("[yellow]No answer from MT4 within 10 s: is the EA on a chart with a smiley face?[/yellow]")
 
 
+@app.command("fx-lab")
+def fx_lab(
+    months: int = typer.Option(12, "--months", help="How many months of history to replay"),
+    step: int = typer.Option(10, "--step", help="Minutes between scans, as the watcher runs them"),
+    symbols: str = typer.Option(None, "--symbols", help="Comma-separated pairs; omit for the default list"),
+    min_rr: float = typer.Option(2.0, "--min-rr", help="Minimum reward-to-risk after the spread"),
+    final: int = typer.Option(6, "--final", help="Most new orders per scan"),
+    refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
+    notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
+):
+    """Quinn's lab: replay today's scanner over past OANDA prices and grade it against the benchmarks."""
+    from datetime import UTC, datetime, timedelta
+
+    from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+    from rich.table import Table
+
+    from tradingagents.dataflows.vendors import oanda
+    from tradingagents.fx import DEFAULT_UNIVERSE, lab, telegram
+    from tradingagents.fx.smc import NEW_YORK
+
+    if months < 1 or step < 1 or final < 1:
+        console.print("[red]--months, --step and --final must be at least 1.[/red]")
+        raise typer.Exit(code=1)
+    names = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
+    _require_oanda(names[0])
+    end = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=round(months * 30.44))
+    history = lab.History(lab.lab_dir() / "history")
+    console.print(f"[bold]Quinn's lab · baseline[/bold] · {start:%d %b %Y} to {end:%d %b %Y} · "
+                  f"{len(names)} instruments · scans every {step} min, 02:00-12:00 New York")
+
+    frames = {}
+    columns = (TextColumn("{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"),
+               TimeRemainingColumn())
+    with Progress(*columns, console=console) as bar:
+        job = bar.add_task("Price history", total=len(names) * len(lab.GRANULARITIES))
+        for symbol in names:
+            for gran in lab.GRANULARITIES:
+                bar.update(job, description=f"Price history · {symbol} {gran}")
+                try:
+                    frames[(symbol, gran)] = history.ensure(symbol, gran, start - lab.WARMUP, end,
+                                                            oanda.get_candle_history, refresh=refresh)
+                except Exception as exc:
+                    console.print(f"[yellow]{symbol} {gran}: {exc}; left out.[/yellow]")
+                bar.advance(job)
+    feed = lab.HistoricalFeed(frames)
+    rules = lab.Rules(step_minutes=step, min_rr=min_rr, final=final)
+    days = max((end - start).days, 1)
+    with Progress(*columns, console=console) as bar:
+        job = bar.add_task("Replaying", total=days)
+
+        def moved(t, orders):
+            done = (t - start).days
+            bar.update(job, completed=done,
+                       description=f"Replaying · {t.astimezone(NEW_YORK):%d %b %Y} · {orders} orders")
+
+        entries = lab.replay(feed, names, start, end, rules, progress=moved)
+        bar.update(job, completed=days)
+    used = sorted({s for s, _ in frames})
+    report = lab.summarize(entries, start, end, used, rules)
+    md, js = lab.save(report, entries, lab.lab_dir())
+    console.print(f"\n[bold]{report.verdict}[/bold]\n")
+    table = Table(title="Against the benchmarks")
+    for col in ("Measure", "Result", "Red line", "Target", "Strong", "Grade"):
+        table.add_column(col, justify="right" if col not in ("Measure", "Grade") else "left")
+    for key, (label, red, target, strong, _, fmt) in lab.BENCHMARKS.items():
+        value = report.metrics.get(key)
+        table.add_row(label, "—" if value is None else fmt.format(value), fmt.format(red), fmt.format(target),
+                      fmt.format(strong), report.grades[key])
+    console.print(table)
+    m = report.metrics
+    console.print(f"{report.orders} orders, {report.filled} filled ({m['filled_per_day']} a day), "
+                  f"total {m['total_r']:+.2f}R.")
+    console.print(f"Full report: {md}\nTrades for Quinn: {js}")
+    if notify and telegram.configured():
+        try:
+            telegram.send(lab.telegram_summary(report))
+        except telegram.TelegramError as exc:
+            console.print(f"[yellow]Telegram: {exc}[/yellow]")
+
+
 def _fx_desk_inputs(setups, now):
     """Tickets for the candidates and a snapshot of the live book, for a review."""
     from tradingagents.dataflows.vendors import oanda

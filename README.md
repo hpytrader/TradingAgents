@@ -442,6 +442,12 @@ MT4 has no API on a Mac, so the watcher and the Expert Advisor `TradingAgentsBri
 4. `tradingagents fx-mt4` checks the link and lists how each symbol maps (fix one with `--symbol XAUUSD=GOLD`).
 5. Run the watcher with `--mt4`. `tradingagents fx-mt4 --flatten` cancels and closes everything the desk has in MT4.
 
+### Quinn's lab: backtesting the desk's rules
+
+`tradingagents fx-lab` replays today's SMC scanner over past OANDA prices (12 months by default, `--months`) and grades the result against the desk's benchmarks: win rate, expectancy, profit factor, fill rate, target-before-fill, drawdown and losing streak, with a verdict on whether the rules alone show an edge. It scans every ten minutes inside the 02:00-12:00 window and applies the live rules (one order per symbol and side, the 14:00 cancel, the 17:00 close), settling each order with the journal's own simulator and a typical spread. There are no agents in the baseline: it is the bar that new rules, and the agents' filtering, must beat.
+
+The feed shows the scanner only bars that had closed at each scan, so nothing is known before it happened. History is downloaded once into `~/.tradingagents/lab/history` and topped up on later runs; each report is saved as Markdown, with every simulated trade as JSON, in `~/.tradingagents/lab`. A year on all fourteen instruments takes roughly half an hour.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.

@@ -29,8 +29,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
+import numpy as np
 import pandas as pd
 import pytz
+from numpy.lib.stride_tricks import sliding_window_view
 
 from tradingagents.fx import indicators as ind
 
@@ -91,13 +93,21 @@ class Zone:
 
 def swings(frame: pd.DataFrame, wing: int = 2) -> list[Swing]:
     """Confirmed swing highs and lows, oldest first."""
-    highs, lows = frame["high"].to_numpy(), frame["low"].to_numpy()
+    highs, lows = frame["high"].to_numpy(dtype=float), frame["low"].to_numpy(dtype=float)
+    size = 2 * wing + 1
+    if len(frame) < size:
+        return []
+    h_win, l_win = sliding_window_view(highs, size), sliding_window_view(lows, size)
+    h_mid, l_mid = h_win[:, wing], l_win[:, wing]
+    # the strict extreme of its window: the highest (lowest) bar, and the only one at that price
+    is_high = (h_mid == h_win.max(axis=1)) & ((h_win == h_mid[:, None]).sum(axis=1) == 1)
+    is_low = (l_mid == l_win.min(axis=1)) & ((l_win == l_mid[:, None]).sum(axis=1) == 1)
     out = []
-    for i in range(wing, len(frame) - wing):
-        h_win, l_win = highs[i - wing:i + wing + 1], lows[i - wing:i + wing + 1]
-        if highs[i] == h_win.max() and (h_win == highs[i]).sum() == 1:
+    for j in np.flatnonzero(is_high | is_low):
+        i = int(j) + wing
+        if is_high[j]:
             out.append(Swing(i, float(highs[i]), "high"))
-        if lows[i] == l_win.min() and (l_win == lows[i]).sum() == 1:
+        if is_low[j]:
             out.append(Swing(i, float(lows[i]), "low"))
     return out
 
@@ -170,7 +180,7 @@ def pools(frame: pd.DataFrame, now: datetime, atr: float, wing: int = 2) -> list
     out: list[Pool] = []
     if frame.empty:
         return out
-    days = pd.Series([trading_day(t) for t in frame.index], index=frame.index)
+    days = pd.Series((frame.index.tz_convert(NEW_YORK) + pd.Timedelta(hours=7)).date, index=frame.index)
     today = trading_day(pd.Timestamp(now))
     earlier = sorted(d for d in days.unique() if d < today)
     if earlier:
