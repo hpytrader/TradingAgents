@@ -43,6 +43,8 @@ STALE_AFTER = timedelta(seconds=90)         # no state file this fresh: the EA i
 ANSWER_WITHIN = timedelta(minutes=2)        # the EA ignores an instruction older than this
 MIN_LIFE = timedelta(minutes=5)             # don't place an order about to be cancelled
 PRICE_SANITY = 0.03                          # entry this far from CMC's price: wrong symbol or scale
+MAX_RETRIES = 3                              # re-sends of an order that timed out, never one MT4 refused
+RETRYABLE = ("stale instruction", "MT4 did not answer")
 ALIASES = {"XAUUSD": ("GOLD",), "XAGUSD": ("SILVER",)}
 
 # Broker-side states of one order.
@@ -307,6 +309,7 @@ class Bridge:
         self.lots = lots
         self.overrides = symbols or {}
         self._warned: set[str] = set()
+        self._retries: dict[str, int] = {}
         with closing(self._db()) as db, db:
             db.execute(TABLE)
 
@@ -474,6 +477,10 @@ class Bridge:
         ok, action = ans.get("ok") == "1", row.inflight_action
         message = ans.get("message", "")
         row.inflight = row.inflight_action = row.inflight_at = None
+        if not ok and message.startswith(RETRYABLE) and action != "place":
+            row.note = message                 # arrived late: the next sync sends it again
+            self._save(row, now)
+            return
         if action == "place":
             if ok:
                 row.state, row.mt4 = B_PENDING, int(ans.get("mt4") or 0) or None
@@ -482,7 +489,10 @@ class Bridge:
                        f"{row.lots:g} lot placed (MT4 #{row.mt4})")
             else:
                 row.state, row.note = FAILED, message
-                notify(f"⚠️ <b>CMC refused</b> {row.ticket} {row.symbol}: {message}")
+                if message.startswith(RETRYABLE):
+                    notify(f"⏳ <b>CMC</b> {row.ticket} {row.symbol}: the instruction reached MT4 late; re-sending")
+                else:
+                    notify(f"⚠️ <b>CMC refused</b> {row.ticket} {row.symbol}: {message}")
         elif action == "modify":
             row.sent_sl, row.sent_tp = row.want_sl, row.want_tp   # tried: don't retry the same values
             if ok:
@@ -501,7 +511,7 @@ class Bridge:
         row.inflight = row.inflight_action = row.inflight_at = None
         if action == "place":
             row.state, row.note = FAILED, "MT4 did not answer in time"
-            notify(f"⚠️ <b>CMC</b> {row.ticket} {row.symbol} was not placed: MT4 did not answer in time.")
+            notify(f"⚠️ <b>CMC</b> {row.ticket} {row.symbol}: MT4 did not answer in time.")
         elif action == "modify":
             row.sent_sl, row.sent_tp = row.want_sl, row.want_tp
         else:
@@ -540,8 +550,16 @@ class Bridge:
             if not e.ticket:
                 continue
             row = rows.get(e.ticket)
-            if row is None:
+            if row is None or (row.state == FAILED and row.note.startswith(RETRYABLE)):
                 if e.status == PENDING and e.expires_at - now >= MIN_LIFE:
+                    if row is not None:                # timed out, not refused: try again
+                        tries = self._retries.get(e.ticket, 0)
+                        if tries >= MAX_RETRIES:
+                            self._warn(f"gave-up {e.ticket}", f"⚠️ <b>CMC</b> {e.ticket} {e.symbol} not placed: "
+                                       f"gave up after {MAX_RETRIES} retries ({row.note}).", notify)
+                            continue
+                        self._retries[e.ticket] = tries + 1
+                        notes.append(f"re-sending {e.ticket} {e.symbol} to MT4 ({row.note})")
                     self._place(e, state, now, notify, notes)
                 continue
             if row.inflight:
