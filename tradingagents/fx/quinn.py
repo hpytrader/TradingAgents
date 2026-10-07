@@ -72,6 +72,8 @@ class Experiment:
     symbols: tuple[str, ...] = ()           # empty: every instrument
     skip_wide_spread: bool = False
     stop_mult: float = 1.0                  # widen the stop to this many times its distance (target kept)
+    retarget_r: float | None = None         # then set the target this many R away, after the spread
+    max_spread_share: float | None = None   # skip a setup whose spread is more than this share of its risk
     manage: str | None = None               # "breakeven" or "half_off" once the trade is +1R
 
     def admits(self, s: Setup, t: datetime) -> bool:
@@ -91,6 +93,9 @@ class Experiment:
             return False
         if f.get("displacement", 0.0) < self.min_displacement or f.get("depth", 0.0) < self.min_depth:
             return False
+        if self.max_spread_share is not None and s.risk_pips > 0 and \
+                s.spread_pips / s.risk_pips > self.max_spread_share:
+            return False
         return not (self.skip_wide_spread and f.get("wide_spread"))
 
     def adjust(self, s: Setup) -> Setup:
@@ -103,6 +108,12 @@ class Experiment:
             reward = abs(s.target - s.entry)
             s = replace(s, stop=spec.round_price(s.entry - sign * wider), risk_pips=round(spec.pips(wider), 1),
                         rr=round((reward - spread) / (wider + spread), 2))
+        if self.retarget_r is not None:
+            risk = abs(s.entry - s.stop)
+            target = s.entry + sign * (self.retarget_r * (risk + spread) + spread)
+            reward = abs(target - s.entry)
+            s = replace(s, target=spec.round_price(target), reward_pips=round(spec.pips(reward), 1),
+                        rr=round((reward - spread) / (risk + spread), 2), target_kind=f"{self.retarget_r:g}R")
         if self.target_r is None:
             return s
         risk = abs(s.entry - s.stop)
@@ -140,7 +151,11 @@ class Experiment:
         if self.skip_wide_spread:
             rules.append("no wide-spread setups")
         if self.stop_mult != 1.0:
-            rules.append(f"stops {self.stop_mult:g}x as far, same targets")
+            rules.append(f"stops {self.stop_mult:g}x as far" + ("" if self.retarget_r else ", same targets"))
+        if self.retarget_r is not None:
+            rules.append(f"targets {self.retarget_r:g}R after the spread")
+        if self.max_spread_share is not None:
+            rules.append(f"spread at most {self.max_spread_share:.0%} of the risk")
         if self.manage == "breakeven":
             rules.append("stop to break-even at +1R")
         elif self.manage == "half_off":
@@ -344,7 +359,32 @@ SECOND_BATCH: tuple[Experiment, ...] = (
         stop_mult=1.5, manage="half_off"),
 )
 
-BATCHES = {1: FIRST_BATCH, 2: SECOND_BATCH}
+THIRD_BATCH: tuple[Experiment, ...] = (
+    Experiment(
+        "far-side-stop",
+        "The breakout makes +0.06R before the spread but the spread is 16% of each trade's risk. A stop "
+        "at the far side of the Asian range doubles the risk, halves the spread's share, and is where the "
+        "break is truly wrong; the target stays 2R of the new risk.",
+        stop_mult=2.0, retarget_r=2.0),
+    Experiment(
+        "spread-under-10pct",
+        "Costs, not direction, sink the breakout: skip any setup whose spread is more than a tenth of its "
+        "risk. A rule about costs, not about which pairs did well last year.",
+        max_spread_share=0.10),
+    Experiment(
+        "far-stop-low-cost",
+        "Both cost cuts at once: the far-side stop, then only setups where the spread is under a tenth of "
+        "that larger risk.",
+        stop_mult=2.0, retarget_r=2.0, max_spread_share=0.10),
+    Experiment(
+        "far-stop-nearer-target",
+        "The far-side stop with a 1.5R target: the wider risk makes 2R a long way for one session (18% of "
+        "breakout trades were still open at 16:55), so a nearer target is reached more often.",
+        stop_mult=2.0, retarget_r=1.5),
+)
+
+BATCHES = {1: FIRST_BATCH, 2: SECOND_BATCH, 3: THIRD_BATCH}
+BATCH_MODELS = {1: ("smc",), 2: ("smc",), 3: ("asian", "asian-market")}   # the model each batch was written for
 
 
 def report(rows: list[dict], base_design: Result, base_locked: Result | None, ledger: Ledger) -> str:

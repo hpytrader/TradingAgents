@@ -567,6 +567,7 @@ def fx_mt4(
     lots: float = typer.Option(None, "--lots", help="Lot size for every order (default 0.01)"),
     symbol: str = typer.Option(None, "--symbol", help="Map symbols to the broker's names, e.g. XAUUSD=GOLD,XAGUSD=SILVER"),
     flatten: bool = typer.Option(False, "--flatten", help="Cancel every pending order and close every trade of the desk in MT4 now"),
+    spreads: bool = typer.Option(False, "--spreads", help="Show the spreads the bridge has recorded at CMC, by hour"),
     test_order: str = typer.Option(None, "--test-order", help="Place a buy limit 1% under the price on this symbol (e.g. EURUSD or USDJPY.r) and cancel it at once"),
 ):
     """Connect the desk to MetaTrader 4 (e.g. CMC Markets): setup, status, a test order, and an emergency flatten."""
@@ -623,6 +624,27 @@ def fx_mt4(
 
     bridge = Bridge(cfg.files_dir, _fx_journal(), lots=cfg.lots, symbols=cfg.symbols)
     now = datetime.now(UTC)
+    if spreads:
+        from rich.table import Table
+
+        from tradingagents.fx.lab import TYPICAL_SPREAD_PIPS
+        recorded = bridge.spreads()
+        if not recorded:
+            console.print("No spreads recorded yet: they are logged while the watcher runs with --mt4.")
+            raise typer.Exit()
+        table = Table(title="CMC spreads in pips (average), by New York time")
+        for col in ("Symbol", "02-07 London", "08-11 New York", "12-16 afternoon", "Readings", "Lab estimate"):
+            table.add_column(col, justify="left" if col == "Symbol" else "right")
+
+        def avg(by_hour, hours):
+            n = sum(by_hour[h][0] for h in hours if h in by_hour)
+            return "—" if not n else f"{sum(by_hour[h][0] * by_hour[h][1] for h in hours if h in by_hour) / n:.2f}"
+        for symbol in sorted(recorded):
+            by_hour = recorded[symbol]
+            table.add_row(symbol, avg(by_hour, range(2, 8)), avg(by_hour, range(8, 12)), avg(by_hour, range(12, 17)),
+                          str(sum(v[0] for v in by_hour.values())), f"{TYPICAL_SPREAD_PIPS.get(symbol, 0):g}")
+        console.print(table)
+        raise typer.Exit()
     if flatten:
         if not typer.confirm("Cancel ALL of the desk's pending orders and close ALL its trades in MT4 now?"):
             raise typer.Exit()
@@ -682,10 +704,11 @@ def fx_lab(
     final: int = typer.Option(6, "--final", help="Most new orders per scan"),
     experiments: bool = typer.Option(False, "--experiments", help="Run Quinn's ideas: design year, then the locked year"),
     batch: int = typer.Option(None, "--batch", help="Which batch of Quinn's ideas to run (default: the newest)"),
-    model: str = typer.Option("smc", "--model", help="smc: sweep and reversal (the desk's model); asian: Asian-range breakout"),
+    model: str = typer.Option("smc", "--model", help="smc: sweep and reversal (the desk's model); asian: Asian-range breakout on the retest; asian-market: the breakout joined at market"),
     timeframe: str = typer.Option("m5", "--timeframe", help="m5: 1-hour bias, 5-minute entries (the desk's model); m15: 4-hour bias, 15-minute entries"),
     anatomy: bool = typer.Option(False, "--anatomy", help="Study how the design year's trades played out: costs, stops, exits"),
     refresh: bool = typer.Option(False, "--refresh", help="Download the history again instead of topping it up"),
+    spreads: str = typer.Option("estimate", "--spreads", help="estimate: typical spreads; cmc: the spreads your MT4 bridge recorded"),
     notify: bool = typer.Option(False, "--notify", help="Send the summary to Telegram"),
 ):
     """Quinn's lab: replay today's scanner over past OANDA prices and grade it, or test new ideas with --experiments."""
@@ -705,10 +728,10 @@ def fx_lab(
     if timeframe not in lab.WARMUPS:
         console.print("[red]--timeframe must be m5 or m15.[/red]")
         raise typer.Exit(code=1)
-    if model not in ("smc", "asian"):
-        console.print("[red]--model must be smc or asian.[/red]")
+    if model not in ("smc", "asian", "asian-market"):
+        console.print("[red]--model must be smc, asian or asian-market.[/red]")
         raise typer.Exit(code=1)
-    if model == "asian":
+    if model.startswith("asian"):
         timeframe = "m5"
     names = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else list(DEFAULT_UNIVERSE)
     _require_oanda(names[0])
@@ -722,7 +745,8 @@ def fx_lab(
     console.print(f"[bold]Quinn's lab · {title}[/bold] · design year {start:%d %b %Y} to {end:%d %b %Y}"
                   + (f" · locked year {locked_start:%d %b %Y} to {start:%d %b %Y}" if experiments and not anatomy else "")
                   + f" · {len(names)} instruments · "
-                  + ("Asian-range breakout" if model == "asian" else
+                  + ("Asian-range breakout, joined at market" if model == "asian-market" else
+                     "Asian-range breakout, on the retest" if model == "asian" else
                      "SMC, 4-hour bias, 15-minute entries" if timeframe == "m15" else "SMC, 1-hour bias, 5-minute entries")
                   + f" · scans every {step} min, 02:00-12:00 New York")
 
@@ -742,7 +766,17 @@ def fx_lab(
                 except Exception as exc:
                     console.print(f"[yellow]{symbol} {gran}: {exc}; left out.[/yellow]")
                 bar.advance(job)
-    feed = lab.HistoricalFeed(frames)
+    costs = None
+    if spreads.lower() == "cmc":
+        from tradingagents.fx.mt4 import Bridge, Mt4Config
+        cfg = Mt4Config.load()
+        recorded = Bridge(cfg.files_dir, _fx_journal()).spreads() if cfg and cfg.files_dir else {}
+        if not recorded:
+            console.print("[red]No CMC spreads recorded yet: run the watcher with --mt4 for a few days first.[/red]")
+            raise typer.Exit(code=1)
+        costs = lab.broker_spreads(recorded)
+        console.print("Spreads from CMC (pips): " + ", ".join(f"{k} {v:g}" for k, v in sorted(costs.items())))
+    feed = lab.HistoricalFeed(frames, costs)
     used = sorted({s for s, _ in frames})
 
     def scans(a, b, label):
@@ -831,6 +865,9 @@ def fx_lab(
         console.print(f"[red]No batch {number}; there are {sorted(quinn.BATCHES)}.[/red]")
         raise typer.Exit(code=1)
     console.print(f"Batch {number}: {len(quinn.BATCHES[number])} ideas")
+    if model not in quinn.BATCH_MODELS.get(number, (model,)):
+        console.print(f"[yellow]Batch {number} was written for --model "
+                      f"{' or '.join(quinn.BATCH_MODELS[number])}; you are running --model {model}.[/yellow]")
     for exp in quinn.BATCHES[number]:
         console.print(f"Trying [bold]{exp.name}[/bold]: {exp.describe()}")
         row = quinn.run(exp, lambda e: lab.trade(design_log, feed, end, rules, e),

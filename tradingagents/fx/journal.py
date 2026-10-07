@@ -134,6 +134,7 @@ class Entry:
     initial_stop: float | None = None     # the stop at entry: R is always measured against it
     settled_to: datetime | None = None    # prices replayed up to here; later changes apply after it
     changes: list = field(default_factory=list)   # trade-manager actions, oldest first
+    order: str = "limit"                  # "limit", or "market" (lab only: filled on the first bar)
 
     @property
     def long(self) -> bool:
@@ -458,6 +459,9 @@ def simulate(e: Entry, bars: pd.DataFrame, now: datetime) -> Entry:
     rows = list(bars.itertuples())
     k = 0
 
+    if e.status == PENDING and e.order == "market" and rows:
+        # filled at the first bar's open; that bar's stop and target are judged below, stop first
+        e.status, e.filled_at = OPEN, rows[0].Index.to_pydatetime()
     if e.status == PENDING:
         while k < len(rows):
             bar = rows[k]

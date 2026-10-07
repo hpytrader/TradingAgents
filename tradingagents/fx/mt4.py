@@ -39,6 +39,7 @@ from pathlib import Path
 
 from tradingagents.fx.instruments import spec_for
 from tradingagents.fx.journal import ACTIVE, CANCELLED, CLOSED, PENDING, Entry, Journal, flat_by
+from tradingagents.fx.smc import NEW_YORK
 
 EA_FILE = Path(__file__).with_name("TradingAgentsBridge.mq4")
 STALE_AFTER = timedelta(seconds=90)         # no state file this fresh: the EA is not running
@@ -55,6 +56,18 @@ SENDING, B_PENDING, B_OPEN, B_CLOSED, B_CANCELLED, FAILED = (
 LIVE = (SENDING, B_PENDING, B_OPEN)
 
 Notify = Callable[[str], None]
+
+SPREADS = """
+CREATE TABLE IF NOT EXISTS mt4_spreads (
+    symbol TEXT,
+    hour INTEGER,
+    n INTEGER,
+    total REAL,
+    low REAL,
+    high REAL,
+    PRIMARY KEY (symbol, hour)
+)
+"""
 
 TABLE = """
 CREATE TABLE IF NOT EXISTS mt4_orders (
@@ -314,8 +327,11 @@ class Bridge:
         self.overrides = symbols or {}
         self._warned: set[str] = set()
         self._retries: dict[str, int] = {}
+        self._recorded_at: datetime | None = None
+        self._names: dict[str, str] | None = None        # the desk's symbol for each broker symbol
         with closing(self._db()) as db, db:
             db.execute(TABLE)
+            db.execute(SPREADS)
             columns = {r[1] for r in db.execute("PRAGMA table_info(mt4_orders)")}
             if "half_spread" not in columns:              # tables from before spread adjustment
                 db.execute("ALTER TABLE mt4_orders ADD COLUMN half_spread REAL")
@@ -475,10 +491,46 @@ class Bridge:
             self._warned.discard("down")
             notify("✅ <b>CMC MT4</b>\nBridge is back.")
 
+        self._record_spreads(state)
         for row in rows.values():
             self._follow_broker(row, state, now, notify)
         self._follow_journal(rows, state, now, notify, notes)
         return notes
+
+    # -- the broker's real spreads ----------------------------------------------
+
+    def _record_spreads(self, state: State) -> None:
+        """Add each instrument's spread now, in pips, to its New York hour's running total."""
+        if state.time == self._recorded_at or not state.quotes:
+            return
+        self._recorded_at = state.time
+        if self._names is None:
+            from tradingagents.fx import DEFAULT_UNIVERSE
+            names = self.broker_symbols() or list(state.quotes)
+            self._names = {b: s for s in DEFAULT_UNIVERSE if (b := map_symbol(s, names, self.overrides))}
+        hour = state.time.astimezone(NEW_YORK).hour
+        rows = []
+        for broker, (bid, ask) in state.quotes.items():
+            symbol = self._names.get(broker)
+            if symbol is None or ask <= bid:
+                continue
+            rows.append((symbol, hour, (ask - bid) / spec_for(symbol).pip))
+        if not rows:
+            return
+        with closing(self._db()) as db, db:
+            for symbol, hr, pips in rows:
+                db.execute("INSERT INTO mt4_spreads (symbol, hour, n, total, low, high) VALUES (?,?,1,?,?,?) "
+                           "ON CONFLICT(symbol, hour) DO UPDATE SET n = n + 1, total = total + excluded.total, "
+                           "low = MIN(low, excluded.low), high = MAX(high, excluded.high)",
+                           (symbol, hr, pips, pips, pips))
+
+    def spreads(self) -> dict[str, dict[int, tuple[int, float, float, float]]]:
+        """Recorded spreads: symbol → New York hour → (samples, average, lowest, highest), in pips."""
+        out: dict[str, dict[int, tuple[int, float, float, float]]] = {}
+        with closing(self._db()) as db:
+            for r in db.execute("SELECT symbol, hour, n, total, low, high FROM mt4_spreads"):
+                out.setdefault(r["symbol"], {})[r["hour"]] = (r["n"], r["total"] / r["n"], r["low"], r["high"])
+        return out
 
     def _answered(self, row: Row, ans: dict[str, str], now: datetime, notify: Notify) -> None:
         ok, action = ans.get("ok") == "1", row.inflight_action

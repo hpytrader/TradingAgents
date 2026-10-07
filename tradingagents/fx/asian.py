@@ -45,6 +45,7 @@ RANGE_START, RANGE_END = time(0, 0), time(6, 0)      # UTC: the Asian session
 MIN_WIDTH_ATR = 1.0
 MAX_WIDTH_ATR = 5.0
 MAX_BREAKOUT_AGE = timedelta(hours=3)
+MAX_MARKET_AGE = timedelta(minutes=15)                # a market entry joins only a fresh break
 STALE_AFTER = timedelta(minutes=30)
 M5_BARS, H1_BARS = 600, 300
 
@@ -75,6 +76,7 @@ def scan_asian(
     latest_cancel: time = LATEST_CANCEL,
     now: datetime | None = None,
     timeframes=None,                                  # accepted for the lab's sake; this model is M5 + H1
+    entry_mode: str = "retest",                       # "retest": limit at the broken level; "market": join now
 ) -> ScanResult:
     """Every instrument whose Asian range broke this morning, as a retest limit order."""
     now = now or datetime.now(UTC)
@@ -86,7 +88,7 @@ def scan_asian(
     best, skipped = [], []
     for symbol in symbols:
         try:
-            found = _setup(symbol, candles, quote, now, min_rr, expires)
+            found = _setup(symbol, candles, quote, now, min_rr, expires, entry_mode)
         except Exception as exc:  # one pair's data problem must not end the scan
             skipped.append((symbol, f"data unavailable: {exc}"))
             continue
@@ -98,7 +100,7 @@ def scan_asian(
 
 
 def _setup(symbol: str, candles: CandleFetcher, quote: QuoteFetcher, now: datetime, min_rr: float,
-           expires: datetime) -> Setup | str:
+           expires: datetime, entry_mode: str = "retest") -> Setup | str:
     spec = spec_for(symbol)
     m5 = candles(symbol, "M5", M5_BARS)
     h1 = candles(symbol, "H1", H1_BARS)
@@ -128,13 +130,17 @@ def _setup(symbol: str, candles: CandleFetcher, quote: QuoteFetcher, now: dateti
     bar_end = first.to_pydatetime() + timedelta(minutes=5)
     if now - bar_end > MAX_BREAKOUT_AGE:
         return f"the breakout at {first:%H:%M} UTC is more than {MAX_BREAKOUT_AGE.seconds // 3600}h old"
+    market = entry_mode == "market"
+    if market and now - bar_end > MAX_MARKET_AGE:
+        return f"the breakout at {first:%H:%M} UTC is too old to join at market"
 
     q = quote(symbol)
     bid, ask = float(q.bid), float(q.ask)
     mid, spread = (bid + ask) / 2, max(ask - bid, 0.0)
     sign = 1 if long else -1
-    entry = high if long else low
-    if (mid - entry) * sign <= 0:
+    edge = high if long else low
+    entry = mid if market else edge
+    if (mid - edge) * sign <= 0:
         return (f"price is back through the broken Asian {'high' if long else 'low'}: "
                 f"the {'upside' if long else 'downside'} break failed")
     stop = (high + low) / 2
@@ -147,7 +153,7 @@ def _setup(symbol: str, candles: CandleFetcher, quote: QuoteFetcher, now: dateti
     reward = abs(target - entry)
     rr = (reward - spread) / (risk + spread)
 
-    strength = abs(float(m5.loc[first, "close"]) - entry) / atr1
+    strength = abs(float(m5.loc[first, "close"]) - edge) / atr1
     compression = width / atr1
     breakout_ny = first.tz_convert(smc.NEW_YORK)
     score = (40 + min(strength / 0.5, 1.0) * 20 + max(0.0, (5 - compression) / 4) * 20
@@ -158,8 +164,9 @@ def _setup(symbol: str, candles: CandleFetcher, quote: QuoteFetcher, now: dateti
         f"Asian range {spec.round_price(low)}-{spec.round_price(high)} ({spec.pips(width):.1f} pips, "
         f"{compression:.1f}x the hourly ATR)",
         f"first five-minute close {direction} at {first:%H:%M} UTC ({strength:.2f}x ATR beyond it)",
-        f"{'buy' if long else 'sell'} limit on the retest of {spec.round_price(entry)}; stop at the range "
-        f"middle {spec.round_price(stop)}",
+        (f"{'buy' if long else 'sell'} at market {spec.round_price(entry)}, joining the break"
+         if market else f"{'buy' if long else 'sell'} limit on the retest of {spec.round_price(entry)}")
+        + f"; stop at the range middle {spec.round_price(stop)}",
         f"{rr:.1f}R target after the spread",
         f"{phase(now)} session; cancel at {expires:%H:%M} UTC if unfilled",
     ]
@@ -169,10 +176,11 @@ def _setup(symbol: str, candles: CandleFetcher, quote: QuoteFetcher, now: dateti
         rr=round(rr, 2), score=round(score, 1), risk_pips=round(spec.pips(risk), 1),
         reward_pips=round(spec.pips(reward), 1), spread_pips=round(spec.pips(spread), 1),
         atr_pips=round(spec.pips(atr1), 1), price=spec.round_price(mid), target_kind="range projection",
-        expires_at=expires, reasons=reasons, strategy="asian_breakout",
+        expires_at=expires, reasons=reasons, strategy="asian_breakout_market" if market else "asian_breakout",
         zone_low=spec.round_price(low), zone_high=spec.round_price(high), invalidation=spec.round_price(stop),
         features={"range_atr": round(compression, 2), "breakout_strength": round(strength, 2),
                   "breakout_hour": breakout_ny.hour, "wide_spread": spread > 0.15 * width,
                   "pool": "Asian range", "pool_quality": 2, "shift": "breakout", "h1_break": "none",
-                  "zone": "range edge", "displacement": round(strength, 2), "depth": 0.0},
+                  "zone": "range edge", "displacement": round(strength, 2), "depth": 0.0,
+                  "order": "market" if market else "limit"},
     )

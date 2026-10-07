@@ -145,3 +145,15 @@ def test_managed_trades_replace_their_result_with_the_managed_one():
     managed = lab.trade(log, feed, MON + timedelta(hours=10), experiment=Experiment("x", "", manage="breakeven"))
     assert managed[0].result_r == pytest.approx(-0.0001 / 0.0011, abs=0.01)     # scratched, minus the spread
     assert managed[0].status == "closed" and "managed" in managed[0].note
+
+
+@pytest.mark.unit
+def test_a_far_stop_can_be_retargeted_and_filtered_on_its_spread():
+    s = _setup(MON, entry=1.1710, stop=1.1700, target=1.1732)                       # 1-pip spread, 10-pip risk
+    far = Experiment("x", "", stop_mult=2.0, retarget_r=2.0).adjust(s)
+    assert far.stop == pytest.approx(1.1690) and far.rr == pytest.approx(2.0, abs=0.02)
+    assert far.target == pytest.approx(1.1710 + 2 * 0.0021 + 0.0001)
+    at = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
+    assert not Experiment("x", "", max_spread_share=0.05).admits(_feat(s), at)          # 1/10 of the risk
+    assert Experiment("x", "", max_spread_share=0.05).admits(_feat(far), at)            # 1/20 after widening
+    assert set(quinn.BATCHES) == {1, 2, 3} and quinn.BATCH_MODELS[3] == ("asian", "asian-market")

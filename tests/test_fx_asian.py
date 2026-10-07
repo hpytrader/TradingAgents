@@ -101,3 +101,36 @@ def test_the_lab_can_replay_the_breakout_model():
     a = lab.log_key(["EURUSD"], DAY, DAY + timedelta(days=1), lab.Rules())
     b = lab.log_key(["EURUSD"], DAY, DAY + timedelta(days=1), lab.Rules(model="asian"))
     assert a != b
+
+
+@pytest.mark.unit
+def test_the_market_version_joins_a_fresh_break_now():
+    now = DAY + timedelta(hours=6, minutes=40)
+    m5 = _m5({DAY + timedelta(hours=6, minutes=30): (1.1718, 1.1705, 1.1716)}, now)
+    candles, quote = _feed(m5)
+    [s] = asian.scan_asian(candles, quote, ["EURUSD"], now=now, any_session=True, entry_mode="market").setups
+    assert s.entry == pytest.approx(1.1716) and s.stop == 1.1700 and s.features["order"] == "market"
+    later = DAY + timedelta(hours=7)
+    m5 = _m5({DAY + timedelta(hours=6, minutes=30): (1.1718, 1.1705, 1.1716)}, later)
+    candles, quote = _feed(m5)
+    result = asian.scan_asian(candles, quote, ["EURUSD"], now=later, any_session=True, entry_mode="market")
+    assert not result.setups and "too old to join at market" in result.skipped[0][1]
+
+
+@pytest.mark.unit
+def test_a_market_order_fills_on_the_first_bar_and_judges_the_stop_first():
+    from tradingagents.fx import journal as jr
+    from tradingagents.fx.journal import Entry
+    idx = pd.date_range(DAY, periods=4, freq="5min", tz="UTC")
+    bars = pd.DataFrame({"open": 1.1716, "high": [1.1720, 1.1760, 1.1717, 1.1717],
+                         "low": [1.1712, 1.1714, 1.1715, 1.1715], "close": 1.1716}, index=idx)
+    e = Entry(id="x", created_at=DAY, symbol="EURUSD", direction="long", entry=1.1716, stop=1.1700,
+              target=1.1750, planned_rr=2.0, spread=0.0001, expires_at=DAY + timedelta(hours=4), order="market")
+    jr.simulate(e, bars, DAY + timedelta(hours=1))
+    assert e.filled_at == DAY and e.status == jr.WON and e.exit_at == DAY + timedelta(minutes=5)
+    both = bars.copy()
+    both.loc[DAY, ["high", "low"]] = [1.1760, 1.1690]                          # stop and target in the first bar
+    e2 = Entry(id="y", created_at=DAY, symbol="EURUSD", direction="long", entry=1.1716, stop=1.1700,
+               target=1.1750, planned_rr=2.0, spread=0.0001, expires_at=DAY + timedelta(hours=4), order="market")
+    jr.simulate(e2, both, DAY + timedelta(hours=1))
+    assert e2.status == jr.LOST

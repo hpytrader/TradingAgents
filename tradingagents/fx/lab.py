@@ -56,7 +56,7 @@ GRANULARITIES = ("M5", "H1")           # the desk's model; settling always uses 
 def granularities(timeframe: str = "m5", model: str = "smc") -> tuple[str, ...]:
     """The bars a replay needs: the model's charts, and five-minute bars to settle on."""
     from tradingagents.fx.smc_scanner import profile
-    if model == "asian":
+    if model.startswith("asian"):
         return ("M5", "H1")
     tf = profile(timeframe)
     return tuple(dict.fromkeys(("M5", tf.bias, tf.entry)))
@@ -106,6 +106,21 @@ class History:
             frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         frame.to_csv(self.path(symbol, granularity), index_label="time", compression="gzip")
         return frame[(frame.index >= pd.Timestamp(start)) & (frame.index < pd.Timestamp(end))]
+
+
+def broker_spreads(recorded: dict[str, dict[int, tuple[int, float, float, float]]],
+                   hours: Iterable[int] = range(2, 17), min_samples: int = 30) -> dict[str, float]:
+    """Average recorded broker spreads over the desk's hours (02:00-16:59 New York), in pips.
+
+    Instruments with fewer than ``min_samples`` readings keep the estimate.
+    """
+    out = dict(TYPICAL_SPREAD_PIPS)
+    wanted = set(hours)
+    for symbol, by_hour in recorded.items():
+        n = sum(v[0] for h, v in by_hour.items() if h in wanted)
+        if n >= min_samples:
+            out[symbol] = round(sum(v[0] * v[1] for h, v in by_hour.items() if h in wanted) / n, 2)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +185,8 @@ class Rules:
     window: ScanWindow = field(default_factory=ScanWindow)
     latest_cancel: time = LATEST_CANCEL
     timeframe: str = "m5"                  # "m5": 1h bias, 5m entries; "m15": 4h bias, 15m entries
-    model: str = "smc"                     # "smc": sweep and reversal; "asian": Asian-range breakout
+    model: str = "smc"                     # "smc": sweep and reversal; "asian": Asian-range breakout on the
+                                           # retest; "asian-market": the same, joined at market on the break
 
 
 def scan_times(start: datetime, end: datetime, rules: Rules) -> Iterable[datetime]:
@@ -194,7 +210,7 @@ def _entry(s: Setup, t: datetime, n: int) -> Entry:
                  stop=s.stop, target=s.target, planned_rr=s.rr, spread=s.spread_pips * spec.pip,
                  expires_at=s.expires_at, conviction="scanner", strategy=s.strategy,
                  scanner_score=s.score, ticket=f"B{n}", initial_stop=s.stop,
-                 rationale="; ".join(s.reasons[:3]))
+                 rationale="; ".join(s.reasons[:3]), order=(s.features or {}).get("order", "limit"))
 
 
 ScanLog = list[tuple[datetime, list[Setup]]]
@@ -207,8 +223,11 @@ def scan_log(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end:
     from tradingagents.fx.smc_scanner import profile
     tf = profile(rules.timeframe)
     scanner = scan_smc
-    if rules.model == "asian":
-        from tradingagents.fx.asian import scan_asian as scanner
+    if rules.model.startswith("asian"):
+        from functools import partial
+
+        from tradingagents.fx.asian import scan_asian
+        scanner = partial(scan_asian, entry_mode="market" if rules.model == "asian-market" else "retest")
     symbols = [s for s in symbols if all((s, g) in feed.frames for g in granularities(rules.timeframe, rules.model))]
     log: ScanLog = []
     found = 0
@@ -247,7 +266,8 @@ def trade(log: ScanLog, feed: HistoricalFeed, end: datetime, rules: Rules | None
         live = [(free, e) for free, e in live if t < free]
         setups = offered
         if experiment is not None:
-            setups = [experiment.adjust(s) for s in offered if experiment.admits(s, t)]
+            adjusted = (experiment.adjust(s) for s in offered)          # filters see the adjusted risk
+            setups = [s for s in adjusted if experiment.admits(s, t)]
         on_book = {(e.symbol, e.direction) for _, e in live}
         fresh = [s for s in setups if (s.symbol, s.direction) not in on_book and setup_key(s) not in seen]
         seen |= {setup_key(s) for s in setups}
@@ -306,14 +326,16 @@ def replay(feed: HistoricalFeed, symbols: Iterable[str], start: datetime, end: d
     return trade(scan_log(feed, symbols, start, end, rules, progress), feed, end, rules, experiment)
 
 
-def log_key(symbols: Iterable[str], start: datetime, end: datetime, rules: Rules) -> str:
+def log_key(symbols: Iterable[str], start: datetime, end: datetime, rules: Rules,
+            spreads: dict[str, float] | None = None) -> str:
     """A name for a cached scan log: changes when the period, rules or scanner code change."""
     import hashlib
 
     from tradingagents.fx import asian, smc, smc_scanner
     code = "".join(Path(m.__file__).read_text(encoding="utf-8") for m in (smc, smc_scanner, asian))
     raw = f"{sorted(symbols)}|{start:%Y%m%d}|{end:%Y%m%d}|{rules.step_minutes}|{rules.min_rr}|{rules.final}|" \
-          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{rules.timeframe}|{rules.model}|{code}"
+          f"{rules.max_per_currency}|{rules.window.label()}|{rules.latest_cancel}|{rules.timeframe}|{rules.model}|" \
+          f"{sorted((spreads or TYPICAL_SPREAD_PIPS).items())}|{code}"
     return f"{start:%Y%m%d}-{end:%Y%m%d}-{hashlib.sha1(raw.encode()).hexdigest()[:10]}"
 
 
@@ -322,7 +344,7 @@ def cached_scan_log(folder: Path, feed: HistoricalFeed, symbols: list[str], star
     """:func:`scan_log`, kept on disk so each later experiment skips the slow scanning."""
     import pickle
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"scans-{log_key(symbols, start, end, rules)}.pkl"
+    path = folder / f"scans-{log_key(symbols, start, end, rules, feed.spreads)}.pkl"
     if path.exists():
         with path.open("rb") as fh:
             return pickle.load(fh)

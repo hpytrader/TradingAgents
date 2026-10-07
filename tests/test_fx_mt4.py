@@ -406,3 +406,20 @@ def test_an_older_bridge_table_gains_the_spread_column(tmp_path):
     Bridge(tmp_path / "Files", book)
     with sqlite3.connect(book.path) as db:
         assert "half_spread" in {r[1] for r in db.execute("PRAGMA table_info(mt4_orders)")}
+
+
+@pytest.mark.unit
+def test_the_bridge_records_cmcs_spreads_by_new_york_hour(desk):
+    desk.sync()
+    desk.sync()                                                        # same state file: not counted twice
+    desk.ea.time = NOW + timedelta(minutes=1)
+    desk.ea.write_state()
+    desk.sync(NOW + timedelta(minutes=1))
+    rec = desk.bridge.spreads()
+    n, avg, low, high = rec["EURUSD"][6]                               # 10:00 UTC is 06:00 New York
+    assert n == 2 and avg == pytest.approx(2.0) and low == high
+    assert rec["XAUUSD"][6][1] == pytest.approx(4.0)                   # GOLD, 0.4 wide, in 0.1 pips
+    from tradingagents.fx import lab
+    costs = lab.broker_spreads(rec, min_samples=2)
+    assert costs["EURUSD"] == pytest.approx(2.0) and costs["USDJPY"] == lab.TYPICAL_SPREAD_PIPS["USDJPY"]
+    assert lab.broker_spreads(rec)["EURUSD"] == lab.TYPICAL_SPREAD_PIPS["EURUSD"]    # too few readings yet
